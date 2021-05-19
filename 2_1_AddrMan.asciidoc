@@ -1,0 +1,244 @@
+[[addrman]]
+== AddrMan
+
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 6d1d33d33491
+
+[[history]]
+=== History
+
+In the early versions (before v0.6.0), Bitcoin Core had a much simpler mechanism for storing addresses of known peers. At that time, when the node https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/main.cpp#L1989[received new addresses] from `ADDR` message, they are added to the global variable `https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/net.cpp#L458[mapAddresses]` and to the `https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/net.cpp#L489-L492[addr.dat]` BerkeleyDB 4.8 database. Old addresses https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/main.cpp#L2577[were cleared] periodically.
+
+Since v0.6.0, there has been an addresses manager (also known as AddrMan) implemented in the https://github.com/bitcoin/bitcoin/pull/787[PR #787]. This change also introduced a much more refined control of address management. Two new tables were created, `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L191[tried]` and `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L197[new]`. 
+
+Originally, the `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L191[tried]` table consisted of https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L124[64 buckets], each of which could https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L348[store up to 64 unique addresses] for peers to whom the node had https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/main.cpp#L3493-L3498[successfully established] an incoming or outgoing connection. Along with each stored peer’s address, the node kept the https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L280-L282[timestamp] for the most recent successful connection to this peer.
+
+Each peer’s address was mapped to a bucket in `tried` table by taking the hash of the peer’s https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L17[_(a) IP address_] and https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L22[_(b) group_], where the group defined is https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/netbase.cpp#L808[the /16 IPv4 prefix] containing the peer’s IP address.
+
+The `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L197[new]` table consisted of https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L130[256 buckets],  each  of  which  could  https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L363[hold  up  64  addresses  for  peers] to whom the node had not yet initiated a successful connection.  A node populates the `new` table with information learned from the https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/net.cpp#L1201[DNS seeders], or from https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/main.cpp#L3590[`ADDR` messages].   Addresses  in  the `new` table  also  have  an  associated timestamp;  addresses learned from DNS seeders were stamped with a random timestamp https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/net.cpp#L1196[between 3 and 7 days old], while addresses learned from `ADDR` messages are  stamped  with  their  timestamp  from  the `ADDR` message https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/main.cpp#L3590[plus two hours].
+
+Every address inserted in `new` table belonged to (1) a https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L29[_group_] (the /16 IPv4 prefix of the peer’s IP address) and (2) a https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L30[_source group_] which contains the  /16 IPv4 prefix of the connected peer or DNS seeder from which the node learned about that address.
+
+In the PR version 7.0 (https://github.com/bitcoin/bitcoin/pull/1198[PR #1198]), the BerkeleyDB-managed `addr.dat` was replaced with a flat file called `peers.dat` to store the AddMan data. Later, in the commit https://github.com/bitcoin/bitcoin/pull/8085/commits/d93b14dc5ddfb937b0cc18be425b9d048cefb66b[d93b14d] (from https://github.com/bitcoin/bitcoin/pull/8085[PR #8085]), CAddrDB were moved out of `src/net.{h,cpp}` to `src/addrdb.{h,cpp}`.
+
+[[eclipse_attack]]
+=== Eclipse Attack
+
+On August 2015, the research https://eprint.iacr.org/2015/263.pdf[_Eclipse Attacks on Bitcoin’s Peer-to-Peer Network_] presented the _Eclipse Attack_, which allows an adversary controlling a sufficient number of IP addresses to monopolize all connections to and from a victim bitcoin node. The attacker can then  exploit  the  victim  for  attacks  on  bitcoin’s  mining and consensus system, including double spending,  selfish  mining,  and  adversarial  forks  in  the blockchain.
+
+[[deployed_eclipse]]
+=== Deployed Countermeasures for Eclipse Attacks
+
+This paper analysed the AddrMan functionality and recommended 10 countermeasures. As consequence, some important changes have been made in the network-handling code of Bitcoin protocol. Deployed countermeasures are presented below in chronological order of when they were merged into Bitcoin Core.
+
+[[eclipse_c4]]
+=== Countermeasure 4: Feeler Connections
+
+The research found that a large percentage of addresses in tried tables are stale IP addresses (ranging from 72% to 95% stale), which increases the risk of eclipse attacks.
+
+In the https://github.com/bitcoin/bitcoin/pull/8282[PR #8282] the countermeasure 4 (Feeler Connections) was added to the code. A Feeler connection is an outgoing connection that establish short-lived test connections to randomly selected addresses in `new`. If connection succeeds, the address is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2512[moved from `new` to `tried`]; otherwise, the address https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L319[is evicted from `new`].
+
+Feeler connections confirm the peer's addresses stored in the `new` table are online by https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1933[doing] the VERSION/VERACK handshake before https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2535[disconnecting] and moving them to `tried` table. This test ensures that the `tried` table is replenished with a steady supply of recent online addresses.
+
+https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L70[Only one feeler connection] is attempted at any one time and feeler connections are only attempted after https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1898-L1934[all outgoing connections slots are filled]. To limit the network impact of the feeler connections nodes make one new connection every https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[2 minutes]. Compared with other networking tasks that bitcoind performs the bandwidth increase is very slight. To avoid issues of synchronization there is a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L2032[random sleep] of between 0 and 1000 milliseconds prior to making a feeler connection. To avoid threading issues the feeler connections are made in the https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1772[same thread] as non-feeler connections.
+
+[[eclipse_c3]]
+=== Countermeasure 3: test-before-evict
+
+Before storing an address in its (deterministically-chosen) slot in a bucket in `tried`, first check if there is an https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L249[older address stored in that slot].  If so, a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1966-L1969[short-lived connection], also referred to as a feeler connection, attempts to https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1969[connect to the older address], and if connection is successful, then the older address is not evicted from the `tried` table; the new address is stored in `tried` only https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L577[if the connection fails].
+
+Another small side advantage of _test-before-evict_ is that https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L253[no more than ten addresses] can be in the test buffer at once (defined in https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.h[ADDRMAN_SET_TRIED_COLLISION_SIZE] constant). 
+
+Addresses are only cleared https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L630[one at a time] from the test buffer and since https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1966-L1969[this is a feeler connection], so an attacker is forced https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[to wait at least two minutes] to insert a new address into the `tried` table after filling up the test buffer. This rate limits an attacker attempting to launch an eclipse attack.
+
+[[eclipse_c1]]
+=== Countermeasure 1: Deterministic random eviction
+
+In the https://github.com/bitcoin/bitcoin/pull/5941[PR #5941], the countermeasures 1, 2 and 6 were implemented.
+
+The commit https://github.com/bitcoin/bitcoin/commit/e6b343d880f50d52390c5af8623afa15fcbc65a2[e6b343d] implements the countermeasures 1: when adding an address to the `new` or `tried` tables, each address deterministically hashes to a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L35[single slot] in a single bucket. Before this change, an attacker could increase the number of addresses stored by repeatedly inserting the same address in multiple rounds. This update gave each address a single fixed location in the new and tried tables, which become simple https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.h#L218-L224[fixed-size arrays] instead of sets and vectors.
+
+[[eclipse_c2]]
+=== Countermeasure 2: Random selection
+
+The commit https://github.com/bitcoin/bitcoin/commit/f68ba3f67bd500a64fb8932c6b41924ddc31d76f[f68ba3f] implements the countermeasures 2: The Eclipse paper's attack exploited bitcoin core’s heavy bias towards initiating outgoing connections to addresses with fresh timestamps. This advantage was eliminated when addresses were https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L368[selected at random] from `tried` and `new` tables. 
+
+[[eclipse_c6]]
+=== Countermeasure 6: More buckets
+
+As more buckets are added, an infrastructure attacker needs to increase the number of groups in order to expect to fill the same fraction of the tried table. The commit https://github.com/bitcoin/bitcoin/pull/5941/commits/1d21ba2f5ecbf03086d0b65c4c4c80a39a94c2ee[1d21ba2] added https://github.com/bitcoin/bitcoin/pull/5941/commits/1d21ba2f5ecbf03086d0b65c4c4c80a39a94c2ee#diff-164bd9e2e30f54d0a79eb7cc372309e2f2155edc6c3f051290ab078f03f6a771L130-R146[more buckets and the addresses saved per group were scaled].
+
+Importantly, however,  this  countermeasure  is  helpful  only  when `tried` already contains many legitimate addresses,  so that attacker owns a smaller fraction of the addresses in `tried`. 
+
+However, if `tried` is mostly empty (or contains mostly stale addresses for nodes that are no longer online), the attacker will still own a large fraction of the addresses in `tried`,  even  though  the  number  of `tried` buckets has  increased.   
+
+Thus,  this  countermeasure  is only effective if accompanied by others, such as feeler connections and _test-before-evict_ which increase the number of legitimate addresses stored in `tried`
+
+[[eclipse_c5]]
+=== Countermeasure 5: Anchor connections
+
+Inspired by Tor https://www-users.cs.umn.edu/~hoppernj/single_guard.pdf[entry guard rotation rates], the Eclipse Attack paper recommends adding connections that persist between restarts, known as anchor connections. These long-lasting connections make Eclipse Attack more expensive for the attackers but at the cost of privacy concerns of leaking network topology or transaction sources.
+
+The https://github.com/bitcoin/bitcoin/pull/17428[PR #17428] implements this countermeasure. But instead of adding anchor connections for full-relay connections, this PR scopes anchor connections to block-relay-only connections to help with the privacy concerns stated above. Therefore, the node https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrdb.cpp#L161-L178[persists block-relay-only connections] in the `anchors.dat` file when restarted and attempts to initiate these connections https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1946-L1955[from the peers stored] in the file.
+
+The https://github.com/bitcoin/bitcoin/issues/17326[issue #17326] has some interesting discussion about this countermeasure implementation.
+
+[[undeployed_eclipse]]
+=== Undeployed (or partially deployed) recommended countermeasures
+
+[[eclipse_c7]]
+=== Countermeasure 7: More outgoing connections
+
+The eclipse attack paper recommended adding, "additional outgoing connections without risking that the network will run out of connection capacity."
+
+Version 0.19 added two outbound block-relay-only connections via https://github.com/bitcoin/bitcoin/pull/15759[PR #15759], which do not relay or process transactions or addr messages. This was motivated by the https://arxiv.org/pdf/1812.00942.pdf[TxProbe paper]. Fundamentally, transaction-relay is going to leak information about the node's peers and allows an observer to infer network topology. But block-relay-only connections are much harder to observe than their transaction-relay counterparts.
+
+When considering the addition of more outbound connections by default, there exists a fundamental tradeoff between resource minimization and robustness to peer misbehavior. Adding more connectivity to the network graph makes Bitcoin's network more robust (e.g., to eclipse or partition attacks), but at the cost of more resource utilization.
+
+There are other promising solutions like the https://github.com/bitcoin/bitcoin/pull/21515[Erlay], which improves the bandwidth efficiency of relaying unconfirmed transactions between Bitcoin full nodes.
+
+[[eclipse_c8]]
+=== Countermeasure 8: Ban unsolicited ADDR messages
+
+Currently, unsolicited ADDR messages of https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2708[greater than 10 addresses] are accepted but not relayed. A node could choose not to accept large unsolicited ADDR messages from incoming peers and only solicit ADDR messages from outgoing connections when its new table is near empty. This prevents adversarial incoming connections from flooding a victim's new table with useless or malicious addresses. The tradeoff would be the slower propagation of addresses from new nodes across the network.
+
+[[eclipse_c9]]
+=== Countermeasure 9: Diversify incoming connections
+
+A Bitcoin node can have all of its incoming connections comefrom the same IP address, making it far too easy for a single computer to monopolize a victim’s incoming connections during an eclipse attack or connection-starvation attack. The eclipse attack paper suggests a node accepts only a limited number of connections from the same IP address.
+
+[[eclipse_c10]]
+=== Countermeasure 10: Anomaly detection
+
+The eclipse attack can have several specific patterns that make it detectable, including: (1) a flurry of short-lived incoming TCP connections from diverse IP addresses that send large ADDR messages containing "trash" IP addresses. (2) An attacker that suddenly connects a large number of nodes to the network. (3) As could one that uses eclipsing to decrease the network's mining power dramatically. +
+Monitoring and anomaly detection systems that look for this behavior would be useful. They would, at the very least, force an eclipse attacker to attack at a lower rate or waste resources on overwriting new, rather than useless, IP addresses.
+
+[[erebus_attack]]
+=== Erebus Attack
+
+Erebus attack allows large malicious Internet Service Providers (ISPs) to isolate any targeted public Bitcoin nodes from the Bitcoin peer-to-peer network. The Erebus attack does not require routing manipulation (e.g., BGP hijacks) and hence it is virtually undetectable to any control-plane and even typical data-plane detectors. +
+By partitioning some Bitcoin nodes, an adversary can launch many serious attacks, including attacking Bitcoin consensus, double-spending or 51% mining attacks. 
+
+This research considers a network adversary who has full control of a single AS (autonomous system) network. The adversary may arbitrarily insert/modify/remove/delay any messages traversing the network. Note that typical nation-state adversaries may have such network capability. The adversary’s goal is to control all the peer connections of a target node in the Bitcoin peer-to-peer network.
+
+[[deployed_erebus]]
+=== Deployed Countermeasures for Erebus Attack
+
+Originally, the peers' addresses were stored based on their groups which were defined by the /16 IPv4 prefix of the address. 
+
+Bitcoin Core originally store the peer's address using the group which was defined by https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/netbase.cpp#L808[the /16 IPv4 prefix] of its address.  Since the EREBUS adversary has a very large bandwidth capacity and a significantly large number of IP addresses, it could generate enough IPs to fill the tables and isolate the victims' network. Thus, four countermeasures have been proposed to mitigate the attack. Two of them have already been adopted.
+
+[[erebus_c2]]
+=== Countermeasure 2: More outgoing connections
+
+Increasing the number of outgoing connections also makes Erebus attack significantly harder to occupy all the outgoing connections. Since Bitcoin v0.19.0, there are 10 outgoing connections in total (or 11, considering the feeler connection).
+
+The https://github.com/bitcoin/bitcoin/pull/15759[PR #15759] added 2 outbound https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1898-L1930[block-relay-only connections]. This PR was motivated by the https://arxiv.org/pdf/1812.00942.pdf[TxProbe paper]. The idea is to separate block relay from transaction relay; inferring network connectivity from the relay of blocks/block headers is much more expensive for an adversary.
+
+By increasing the number of connections, this change met countermeasure 2.
+
+[[erebus_c3]]
+=== Countermeasure 3:  Selecting peers with AS topology information
+
+Incorporating AS topology in the peer selection can make attack becomes harder or impossible for the adversaries with IPs distributed in a large number of prefix groups but hosted in a few ASes only. Since Bitcoin v0.20.0, ASN-based grouping is included as a non-default setting.
+
+The https://github.com/bitcoin/bitcoin/pull/16702[PR #16702] implemented this change. Instead of relying on /16 prefix to diversify the connections every node creates, we would instead https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/netaddress.cpp#L792-L801[rely on the (ip -> ASN) mapping], if this mapping https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L1272-L1295[is provided].
+
+The `.map` file is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L104[included in the release], but it also can be created by every user independently via `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L425[-asmap=<file>]` initialization parameter.
+
+[[undeployed_erebus]]
+=== Undeployed countermeasures
+
+[[erebus_c1]]
+=== Countermeasure 1: Table size reduction
+
+Reducing the size of the two tables storing peer IPs makes Erebus attack less effective because the adversary has much larger bandwidth capability and significantly more IP addresses than legitimate peers.
+
+[[erebus_c4]]
+=== Countermeasure 4: Smarter eviction policy
+
+An improved peer eviction policy that protects peers providing fresher block data will make censoring a specific block or transaction from the victim's view becomes less effective if there exists a legitimate incoming connection providing fresher blocks.
+
+.Increase or decrease the size of the `new` and `tried` tables ?
+[NOTE]
+===============================
+As seen in PR #5941, Bitcoin Core increased the size of the tables four times as a countermeasure against the Eclipse attack because it increases the botnet cost. +
+
+However, increasing the table sizes actually makes the EREBUS attack much easier, as the EREBUS adversary has much greater bandwidth capacity and significantly more IP addresses.
+
+This is a case of conflicting requirements, where the tradeoff between both has to be well evaluated.
+===============================
+
+=== Areas for research
+
+=== Evicting an incoming connection
+
+When the number of peers has reached the limit of maximum connections, the next connecting inbound peer will trigger the eviction mechanism.
+
+[source,c++]  
+----
+void CConnman::CreateNodeFromAcceptedSocket(...)
+{
+    // ...
+    if (nInbound >= nMaxInbound)
+    {
+        if (!AttemptToEvictConnection()) {
+            // No connection to evict, disconnect the new connection
+            LogPrint(BCLog::NET, "failed to find an eviction candidate - connection dropped (full)\n");
+            CloseSocket(hSocket);
+            return;
+        }
+    }
+    // ...
+}
+----
+
+This eviction mechanism was implemented in the PR #6374 to prevent DoS attacks, allowing  new incoming connections to evict old incoming connections. Since connection slots are a limited resource, they can be the target of this type of attack.
+
+A DoS connection exhaustion attack is when an adversary fills all available incoming connection slots on the network, then overtakes the outbounds for a victim just starting up. Mitigating this issue it is important to take steps to avoid network partitioning. 
+
+However, this mechanism introduced the possibility of an attacker purposely evict connections. Before that, a successful Eclipse Attack required victim node to be restarted. Today, an attacker might be able to eclipse a node without reboots via connection eviction logic.
+
+Since reboots are no longer needed to perform Eclipse attacks, anchors connections (Eclipse countermeasure #5) provide less security improvements against such attacks.
+
+Even so, this mechanism might increase security. Half of the inbound connections are reserved for the longest running connections and there are several metrics to decide whether a connection will be evicted or not. This makes it much harder for an attacker to dominate in every category than it is to just dominate in a single metric.
+
+[source,c++]  
+----
+bool CConnman::AttemptToEvictConnection()
+{
+    std::vector<NodeEvictionCandidate> vEvictionCandidates;
+    {
+        LOCK(cs_vNodes);
+        for (const CNode* node : vNodes) {
+            if (node->HasPermission(PF_NOBAN))
+                continue;
+            if (!node->IsInboundConn())
+                continue;
+            if (node->fDisconnect)
+                continue;
+            // ...
+            NodeEvictionCandidate candidate = {...};
+            vEvictionCandidates.push_back(candidate);
+        }
+    }
+    const std::optional<NodeId> node_id_to_evict = SelectNodeToEvict(std::move(vEvictionCandidates));
+    // ...
+}
+----
+
+
+
+[[references]]
+=== References
+
+* https://erebus-attack.comp.nus.edu.sg/[A Stealthier Partitioning Attack against Bitcoin Peer-to-Peer Network]
+
+* https://github.com/bitcoin-core/bitcoin-devwiki/wiki/Addrman-and-eclipse-attacks[Addrman and eclipse attacks]
+
+* https://core.ac.uk/download/pdf/288502346.pdf[Characterization of the topology of theBitcoin network]
+
+* https://cs-people.bu.edu/heilman/eclipse[Eclipse Attacks on Bitcoin’s Peer-to-Peer Network]

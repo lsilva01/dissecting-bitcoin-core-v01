@@ -1,0 +1,517 @@
+[[add-relay]]
+== ADDR Relay
+
+When started for the first time, nodes do not know the IP addresses of any other active full nodes. In order to discover some IP addresses, they https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1588[query one or more DNS names] (called DNS seeds) hardcoded into Bitcoin Core.
+
+Once a program has connected to the network, its peers can begin to send it https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L15[ADDR] or https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L16[ADDV2] (address) messages with the IP addresses and port numbers of other peers on the network, providing a fully decentralized method of peer discovery. Bitcoin Core keeps a record of known peers in a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/addrdb.h#L54[persistent on-disk database] which usually allows it to connect directly to those peers on subsequent startups without having to use DNS seeds.
+
+The commit https://github.com/bitcoin/bitcoin/commit/9313c4e6aa4b707c06a86b33d5d2753cd8383340[9313c4e6aa] can be used as a reference to the project’s codebase at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 9313c4e6aa
+
+[[connection-types]]
+=== Connection Types
+
+Before proceeding, it is important to understand the existing connection types.  There are currently six. There is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L123[good documentation] for them in the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h[src/net.h]` file.
+
+|===
+|Connection Type | Description
+
+| INBOUND
+| Inbound connections are those initiated by a peer. This is the only property we know at the time of connection, until P2P messages are exchanged.
+
+| OUTBOUND_FULL_RELAY
+| These are the default connections that we use to connect with the network. There is no restriction on what is relayed; by default we relay blocks, addresses & transactions.
+
+| MANUAL
+| Manual connections are opened to addresses that users explicitly requested via the addnode RPC or the -addnode/-connect configuration options.
+
+| FEELER
+a| Feeler connections are short-lived connections made to check that a node is alive. They can be useful for: 
+
+* test-before-evict: if one of the peers is considered for eviction from the AddrMan (addresses manager) because another peer is mapped to the same slot in the tried table, evict only if this longer-known peer is offline.
+
+* Move node addresses from New to Tried table, so that we have more connectable addresses in our AddrMan.
+
+| BLOCK_RELAY
+| block-relay-only connections to help prevent against partition attacks. By not relaying transactions or addresses, these connections are harder to detect by a third party, thus helping obfuscate the network topology.
+
+| ADDR_FETCH
+| AddrFetch connections are short lived connections used to solicit addresses from peers. These are initiated to addresses submitted via the `-seednode` command line argument, or under certain conditions when the AddrMan is empty.
+
+|===
+
+[[peer_seeding_sources]]
+=== Peer seeding sources
+
+To be able to engage in `ADDR` relay with other peers, a node needs to find them first.
+Peers are discovered from six sources:
+[[loaded_from_peers_dat]]
+==== 1. Loaded from `peers.dat`
+
+When the node is initialized, https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2476[it will read] the `peers.dat` file and check if the has any registered peers. If the file is empty, it is probably the first time that the node is executed.
+
+`peers.dat` stores the addresses and other information about the peers the node has seen. https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2552[Every 15 minutes], as defined in the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L57[DUMP_PEERS_INTERVAL] constant, all known addresses are stored in this file. This also happens when the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2616[node is shut down]. Therefore, at the next startup, the node will have a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2037[list of peers to connect to].
+[[dns_seeds]]
+==== 2. DNS Seeds
+
+If the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/addrdb.cpp#L138[peers.dat]` file is empty, the node will not know which peers to connect to. So it needs to query some servers denominated DNS Seeds which provide a list of IP addresses that have recently been running a Bitcoin client.
+DNS seeds are https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/chainparams.cpp#L121-L129[hardcoded] and stored in `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/chainparams.cpp[src/chainparams.cpp]`.
+
+The `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1588[ThreadDNSAddressSeed]` waits for a while before querying DNS seeds. The waiting time is defined by the constant `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L72[DNSSEEDS_DELAY_MANY_PEERS]` (5 minutes) if there are 1000 peers or more stored. Otherwise, it is defined by the constant `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L71[DNSSEEDS_DELAY_FEW_PEERS]` (11 seconds).
+
+This thread checks whether the node https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1639[was able to connect] successfully to at https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1642[least 2 peers] loaded from the AddrMan (Addresses Manager). In this case, it skips querying DNS and the thread execution finishes. These connections can be either full relay or block relay.
+
+There are few reasons to avoid DNS seeding when possible. It leaks to the ISP that the requester is a running bitcoin node. Also, DNS sources can provide useless or malicious addresses. In addition, as the DNS Seeds are hardcoded, the node are trusting on the developers who can, for example, relegate all newcomers to a separate network and take advantage of them later.
+
+However, the user can https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1596[force the node to always query] for peer addresses via DNS lookup, passing the `-forcednsseed` argument in node startup.
+
+To prevent a single malicious seeder from dominating AddrMan by announcing large numbers of IP addresses, the number of IPs each seeder can contribute is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1677[limited to 256].
+
+Usually, a node will https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1678[query these seeds via the DNS protocol], which resolves to IP addresses independent from the bitcoin protocol. But if the node is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1666[behind a proxy] (or if the seeder https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1690[does not support] service bit filtering over DNS), the seeders are treated as an `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L182[ADDR_FETCH]` connection. Nodes will engage in the Bitcoin protocol handshake and `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` gossip with the seeder. The connection will disconnect soon after.
+[[fixed_seeds]]
+==== 3. Fixed seeds
+
+The DNS Seed servers returns a list of IP addresses that are running (or were recently running) a Bitcoin client. But in the event that the node is experiencing a DNS failure or is unable to reach the DNS Server, there are some hardcoded IP addresses in `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/chainparamsseeds.h[chainparamsseeds.h]` file.
+
+This hardcoded list contains addresses of recently active nodes on the network and is updated every release cycle. The https://github.com/bitcoin/bitcoin/pull/18506pPR #18506] is an example of the process to update the fixed seeds.
+
+The user can also disble the DNS Seeds by passing `-dnsseed=0` at startup. If the `dnsseed` is disabled, `-addnode` is not provided and the `-seednode` is also not provided or did not work, as a fallback, the node attempts to https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1842[expand the peers in AddrMan via fixed seeds].
+
+Before https://github.com/bitcoin/bitcoin/pull/19884[PR #19884], the node would wait 60 seconds before falling back on the fixed seeds. After the PR, this happens immediately if `peers.dat` is empty and `-dnsseed=0`.
+
+[[addr_fetch]]
+==== 4. `ADDR_FETCH` via `-seednode`
+
+The `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/init.cpp#L451[-seednode=<ip>]` argument (passed when initializing the node) causes a short-lived connection to the specified address until some peer addresses are returned and disconnects. The name of this type of connection is `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L182[ADDR_FETCH]`.
+
+The address(es) informed by the user to return some peer addresses are stored in the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L1133[CConnman::m_addr_fetches]` vector through the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L112[CConnman::AddAddrFetch()]` method.
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L182[ADDR_FETCH]` connections are created in the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1709[CConnman::ProcessAddrFetch()]` method https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1716[using that vector]. This connection works exactly like an outbound connection: both nodes will exchange `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L13[VERSION]` message, then the node that originated a connection will make a `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L26[GETDADDR]` request and when this node receives the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L15[ADDR]` message, it will disconnected the peer.
+
+[source,c++]  
+----
+// src/net.cpp
+void CConnman::ProcessAddrFetch()
+{
+    std::string strDest;
+    {
+        //...
+        strDest = m_addr_fetches.front();
+        m_addr_fetches.pop_front();
+    }
+    // ....
+    if (grant) {
+        OpenNetworkConnection(addr, false, &grant, strDest.c_str(), ConnectionType::ADDR_FETCH);
+    }
+}
+
+// src/net_processing.cpp
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::ADDR || msg_type == NetMsgType::ADDRV2) {
+        // ...
+        if (pfrom.IsAddrFetchConn()) {
+            LogPrint(BCLog::NET, "addrfetch connection completed peer=%d; disconnecting\n", pfrom.GetId());
+            pfrom.fDisconnect = true;
+        }
+        return;
+    }
+    //...
+}
+----
+
+This type of connection was created in the https://github.com/bitcoin/bitcoin/pull/1141[PR #1141]. At that time, it was called _OneShot_. It was renamed to `ADDR_FETCH` in the https://github.com/bitcoin/bitcoin/pull/19316[PR #19316].
+
+[[connect_mode]]
+==== 5. Manual connection in `-connect` mode
+
+If the node starts up with the `-connect`, https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1779-L1782[it will connect only to the specified node(s)], disabling automatic outbound or inbound connections.
+
+This might be useful in enterprise settings where internal nodes all only talk to a gateway node, which is responsible for staying in sync with the public Bitcoin network. Manual connections cannot be evicted and do not contribute to the limits of outbound-full-relay and outbound-block-relay.
+
+[[addnode_manual]]
+==== 6. Manual connection with `-addnode`
+
+The node will make an https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2116-L2125[outbound connection to the specified peer] and engage in `ADDR` relay with it.
+
+Unlike `-connect`, `-addnode` does not prevent automatic connections and the limits of outbound-full-relay and outbound-block-relay are still applied for them.
+
+But the limit of manual connections (those created by `addnode`) is defined by the constant `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L66[MAX_ADDNODE_CONNECTIONS]`, whose default value is 8.
+
+The `-addnode` can be passing as https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/init.cpp#L423[initialization parameter] or as an https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/rpc/net.cpp#L274[RPC command].
+
+[[initial_connection]]
+=== Initial Connection
+
+Connecting to a peer is done by https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L949[sending a VERSION message], which contains the local https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/version.h#L12[version number], https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L939[starting block height], and https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1009[current time] to the remote node. The remote node https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2411[responds with its own VERSION message]. Then both nodes https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2433[send a VERACK message] to the other node to indicate the connection has been established.
+
+Once connected, the client can https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2493[send to the remote node GETADDR and ADDR messages] to gather additional peers.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::VERSION) {
+        // ...
+        if (greatest_common_version >= 70016) {
+            m_connman.PushMessage(&pfrom, msg_maker.Make(NetMsgType::SENDADDRV2));
+        }
+
+        m_connman.PushMessage(&pfrom, msg_maker.Make(NetMsgType::VERACK));
+        // ...
+        if (!pfrom.IsInboundConn() && !pfrom.IsBlockOnlyConn()) {
+            if (fListen && !m_chainman.ActiveChainstate().IsInitialBlockDownload())
+            {
+                CAddress addr = GetLocalAddress(&pfrom.addr, pfrom.GetLocalServices());
+                FastRandomContext insecure_rand;
+                if (addr.IsRoutable())
+                {
+                    LogPrint(BCLog::NET, "ProcessMessages: advertising address %s\n", addr.ToString());
+                    pfrom.PushAddress(addr, insecure_rand);
+                } else if (IsPeerAddrLocalGood(&pfrom)) {
+                    addr.SetIP(addrMe);
+                    LogPrint(BCLog::NET, "ProcessMessages: advertising address %s\n", addr.ToString());
+                    pfrom.PushAddress(addr, insecure_rand);
+                }
+            }
+
+            m_connman.PushMessage(&pfrom, CNetMsgMaker(greatest_common_version).Make(NetMsgType::GETADDR));
+            pfrom.fGetAddr = true;
+        }
+        // ...
+    }
+    // ...
+}
+----
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L90[SENDADDRV2]` is a new message type introduced in https://github.com/bitcoin/bips/blob/master/bip-0155.mediawiki[BIP 155] specification, which adds support to v3 Tor hidden service addresses and other privacy-enhancing network protocols. 
+
+Sending such a message indicates that a node can understand and prefers to receive `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L84[ADDRV2]` messages instead of `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` messages.  The `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L90[SENDADDRV2]` message MUST only be sent in response to the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L68[VERSION]` message from a peer and prior to sending the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L73[VERACK]` message.
+
+Nodes with a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/version.h#L12[protocol version] prior to 70016 do not know these messages, so in that case `SENDADDRV2` https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2425[will not be sent]. +
+When the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2646[node receives] a `SENDADDRV2` message, it sets the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L454[m_wants_addrv2]` field of the peer that sent the message https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2653[to true].
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::SENDADDRV2) {
+        // ...
+        pfrom.m_wants_addrv2 = true;
+        return;
+    }
+    // ...
+}
+----
+
+Next, the code https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2466[checks that the connection type is outbound full relay]. If so, the node tries to https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2484[relay the local address] (so that other nodes can try to find it more quickly, as there is no guarantee that an outbound peer is even aware of how to reach the node).
+
+The node also https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2493[tries to do a one-time address fetch] (to help populate/update the addresses manager). If the node is starting up for the first time, the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/addrman.h#L172[AddrMan] (addresses manager) may be quite empty and no one will be able to reach the node, so these mechanisms are important in helping the node to connect to the network.
+
+This is done by https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2493[sending a `GETADDR` message], right after successfully establishing outbound full relay connection.
+
+Note that the flag `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L551[pfrom.fGetAddr]` is then https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2494[set to true]. This flag https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2708[prevents] the first `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` message received from a new outbound peer to be relayed to others.
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L396[CNode& pfrom]` represents information about the peer that is sending the message. This class has the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L732[m_conn_type]` member field that stores the connection type and https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L468-L514[some methods that checks the connection type].
+
+[source,c++]  
+----
+class CNode
+{
+    // ...
+public:
+    bool IsFullOutboundConn() const {
+        return m_conn_type == ConnectionType::OUTBOUND_FULL_RELAY;
+    }
+
+    // ....
+
+    bool IsBlockOnlyConn() const {
+        return m_conn_type == ConnectionType::BLOCK_RELAY;
+    }
+
+    // ...
+
+    bool IsInboundConn() const {
+        return m_conn_type == ConnectionType::INBOUND;
+    }
+
+    bool RelayAddrsWithConn() const
+    {
+        return m_conn_type != ConnectionType::BLOCK_RELAY;
+    }
+private:
+    // ...
+    const ConnectionType m_conn_type;
+    // ...
+}
+
+----
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/init.cpp#L1161[fListen]` is a global variable, which indicates the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2450[node must listen on a port]. The https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/chainparams.cpp#L106[default port for mainnet] is 8333. The port can be changed with `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/init.cpp#L448[-port]` argument and the listening can be disabled with `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/init.cpp#L434[-listen=0]`, so the node will not accept connections from outside.
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L676[CNode::PushAddress(...)]` adds an address to the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[CNode::vAddrToSend]` vector. This vector https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4198[is used to broadcast the addresses] when building `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` or `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L84[ADDRV2]` messages.
+
+[[addr_or_addrv2]]
+=== `ADDR` or `ADDRV2`
+
+The addr (IP address) message relays connection information to peers on the network. Each peer which wants to accept incoming connections creates an `ADDR` or `ADDRV2` message providing its connection information and then sends that unsolicited message to its peers. Some of these peers send this information to their peers (also unsolicited), some of which further distribute it, allowing decentralized peer discovery for any program already on the network.
+
+An `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` or `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L84[ADDRV2]` message may also be sent in response to a `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L135[GETADDR]` message.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::ADDR || msg_type == NetMsgType::ADDRV2) {
+        // ...
+        std::vector<CAddress> vAddr;
+
+        s >> vAddr;
+
+        if (!pfrom.RelayAddrsWithConn()) {
+            LogPrint(BCLog::NET, "ignoring %s message from %s peer=%d\n", msg_type, pfrom.ConnectionTypeAsString(), pfrom.GetId());
+            return;
+        }
+        // ....
+        for (CAddress& addr : vAddr)
+        {
+            // ...
+            pfrom.AddAddressKnown(addr);
+            // ...
+            if (addr.nTime > nSince && !pfrom.fGetAddr && vAddr.size() <= 10 && addr.IsRoutable())
+            {
+                RelayAddress(pfrom, addr, fReachable, m_connman);
+            }
+            if (fReachable)
+                vAddrOk.push_back(addr);
+        }
+        m_addrman.Add(vAddrOk, pfrom.addr, 2 * 60 * 60);
+        if (vAddr.size() < 1000)
+            pfrom.fGetAddr = false;
+        if (pfrom.IsAddrFetchConn()) {
+            LogPrint(BCLog::NET, "addrfetch connection completed peer=%d; disconnecting\n", pfrom.GetId());
+            pfrom.fDisconnect = true;
+        }
+        return;
+    }
+    // ...
+}
+----
+
+When an `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` or `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L84[ADDRV2]` message is received, it is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2673[deserialized] into a vector of addresses (`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L356[CAddress]`).
+If the message was sent by a block-relay peer, it https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2677[will be ignored].
+If the message has more addresses than allowed by constant `MAX_ADDR_TO_SEND` (1000), the peer will be penalized, https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2681[adding 20 points to the misbehavior score].
+
+Then for each address, it is checked whether the peer can https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2697[serve the complete block chain] and whether it can provide blocks and transactions including witness data. 
+This information (about services provided by the peer) is found in the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L396[ServiceFlags nServices]` field of the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L356[CAddress]` class.
+
+The address is then https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2702[added] to the peer's `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L660[AddAddressKnown]`. That way, the node will not relay to the peers the addresses that they already know.
+
+If the address is discouraged (due to peer's misbehavior score) or if it was manually banned, the address https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2705[will be ignored].
+
+If the `fGetAddr` flag is false, the `ADDR` message has 10 or less addreeses and  address is recent and publicly routable on the internet, then the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1550[RelayAddress(...)]` will be called to https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2711[relay the address] to other 1 or 2 randomly chosen peers.
+
+After the loop, the accepted addresses https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2717[are added to AddrMan] (addresses manager).
+
+If the `ADDR` message has less than 1000 addresses, the `fGetAddr` flag will be https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2719[set to false], allowing subsequent ADDR` messages to have their addresses relayed.
+
+If the message is a response to an `ADDR_FETCH` connection, https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2722[the peer will be disconnected], as this type of connection is short-lived.
+
+[[relay_address]]
+=== `RelayAddress()`
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1550[RelayAddress(...)]`, created in the commit https://github.com/bitcoin/bitcoin/commit/53347f0cb99e514815e44a56439a4a10012238f8[53347f0cb], is called only when `ADDR` or `ADDRV2` messages are received and relays an address to a few randomly chosen nodes.
+
+The method https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1572[chooses the same nodes] within a given 24-hour window (if the list of connected nodes does not change) and does not relay to nodes that already know an address.
+
+So, within 24h the node will likely relay a given address once. This is to prevent a peer from unjustly giving their address better propagation by sending it to the node repeatedly.
+
+[source,c++]  
+----
+// src/net_processing.cpp
+static void RelayAddress(...)
+{
+    if (!fReachable && !addr.IsRelayable()) return;
+    // ...
+    // Relay reachable addresses to 2 peers. Unreachable addresses are relayed randomly to 1 or 2 peers.
+    unsigned int nRelayNodes = (fReachable || (hasher.Finalize() & 1)) ? 2 : 1;
+    // ...
+    auto pushfunc = [&addr, &best, nRelayNodes, &insecure_rand] {
+        for (unsigned int i = 0; i < nRelayNodes && best[i].first != 0; i++) {
+            best[i].second->PushAddress(addr, insecure_rand);
+        }
+    };
+
+    connman.ForEachNodeThen(std::move(sortfunc), std::move(pushfunc));
+}
+----
+
+Note that `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1550[RelayAddress (...)]`, despite the name, does not relay the address to the peers. It just https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1585[adds them] to the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[CNode::vAddrToSend]` vector through `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L676[PushAddress(...)]` method.
+The address broadcast is done by `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4153[MaybeSendAddr(...)]`.
+
+[[maybe_send_addr]]
+=== `MaybeSendAddr()`
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4153[MaybeSendAddr(...)]` sends `ADDR` messages on a regular schedule.
+
+[source,c++]  
+----
+void PeerManagerImpl::MaybeSendAddr(...)
+{
+    if (!node.RelayAddrsWithConn()) return;
+
+    assert(node.m_addr_known);
+    // ...
+    if (fListen && !m_chainman.ActiveChainstate().IsInitialBlockDownload() &&
+        node.m_next_local_addr_send < current_time) {
+        // ...
+        node.m_next_local_addr_send = PoissonNextSend(current_time, AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL);
+    }
+    // ...
+    if (current_time <= node.m_next_addr_send) return;
+
+    node.m_next_addr_send = PoissonNextSend(current_time, AVG_ADDRESS_BROADCAST_INTERVAL);
+    // ...
+    node.vAddrToSend.erase(std::remove_if(node.vAddrToSend.begin(), node.vAddrToSend.end(), addr_already_known), node.vAddrToSend.end());
+    // ...
+    if (node.m_wants_addrv2) {
+        msg_type = NetMsgType::ADDRV2;
+        make_flags = ADDRV2_FORMAT;
+    } else {
+        msg_type = NetMsgType::ADDR;
+        make_flags = 0;
+    }
+    m_connman.PushMessage(&node, CNetMsgMaker(node.GetCommonVersion()).Make(make_flags, msg_type, node.vAddrToSend));
+    node.vAddrToSend.clear();
+
+    // we only send the big addr message once
+    if (node.vAddrToSend.capacity() > 40) {
+        node.vAddrToSend.shrink_to_fit();
+    }
+}
+----
+
+Firstly, the method https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4156[verifies the connection type]. It does not relay `ADDR` messages to peers that are connected as block-relay-only (to prevent adversaries from inferring these links from `ADDR` traffic).
+
+Next, it checks that the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L550[node.m_addr_known]` is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4158[instantiated]. The reason is if the connection is block-relay-only type, `node.m_addr_known` https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L2928[will not be instantiated]. This field represents the addresses that the node already knows and is a `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/bloom.h#L110[CRollingBloomFilter]` data type, which is a probabilistic data structure designed to track the most recently inserted elements and allows to verify, rapidly and memory-efficiently, whether an element is present in a set. However, this data structure also produces false positives.
+
+Two variables control the periodicity in which the addresses will be broadcast: `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L554[node.m_next_local_addr_send]` and `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L553[node.m_next_addr_send]`.
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L554[node.m_next_local_addr_send]` represents the next time the node will announce its local address to the peer passed as parameter (`CNode& node`). The `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L123[AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL]` constant (whose value is 24 hours) is used as a basis for calculating when https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4177[the next announcement will be made].
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L553[node.m_next_addr_send]` represents the next time the node will announce all the addresses it knows. It uses the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L125[AVG_ADDRESS_BROADCAST_INTERVAL]` constant (whose value is 30 seconds) as a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4183[basis for the calculation].
+
+Both `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L554[m_next_local_addr_send]` and `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L553[node.m_next_addr_send]` announcement times are not predictable. They follow a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L3011[Poison distribution], so no one can guess when the next send will happen. This functionality was implemented in the https://github.com/bitcoin/bitcoin/pull/7125[PR #7125].
+
+If the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4181[current time is less] than `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L553[node.m_next_addr_send]`, it means that an `ADDR` message was sent to that peer recently. In that case, there is nothing more to do and the function ends.
+
+The maximum limit of addresses to be sent is defined by the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L58[MAX_ADDR_TO_SEND]` constant (whose value is 1000).
+
+All the addresses that will be sent to the peer are stored in the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[node.vAddrToSend]` (the field name is self-explanatory). But before doing so, all addresses known by the peer (stored in `node.m_addr_known`) https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4198[are removed] from `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[node.vAddrToSend]`.
+
+If the node accepts `ADDRV2` (`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L454[node.m_wants_addrv2]`), an `ADDRV2` message https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4207[will be built]. Otherwise, the message will be in https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4210[`ADDRV` format]. The message is then added to the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L803[ConMan] (connection manager) https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4213[queue to be sent].
+
+Finally, `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[node.vAddrToSend]` is cleared. An important note here is that the node sends a 1000-entry `ADDR` (or `ADDRV2`) message to a newly accepted peer, and then uses `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[vAddrToSend]` for small messages only. Thus, the command `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4218[node.vAddrToSend.shrink_to_fit ()]` is called at the end of the function to deallocate the memory that will no longer be used. It was implemented in the https://github.com/bitcoin/bitcoin/pull/8154[PR #8154].
+
+[[getaddr]]
+=== `GETADDR`
+
+The first thing the node does when it receives a `GETADDR` message is to ignore it if it is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3573[from an outbound connection]. It prevents potential privacy issues. +
+The only time a Bitcoin node https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2493[sends a `GETAADR` message] is when establishing an outbound connection. Therefore, the recipient Bitcoin node expects to receive a `GETAADR` message only on inbound connection. So `GETADDR` message from outbound connections can be safely ignored. This was implemented in the https://github.com/bitcoin/bitcoin/pull/5442[PR #5442].
+
+After that, the node checks whether the peer is sending a `GETADDR` message https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3580[for second time]. In that case, the message will also be ignored. +
+This conserves resources from abusive peers that just send `GETADDR` in a loop. Also makes correlating `ADDR` or `ADDRV2` messages against INVs less effective. This was implemented in the https://github.com/bitcoin/bitcoin/pull/7856[PR #7856].
+
+There are two ways to build the addresses to be sent. If the peer requesting them has the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_permissions.h#L34[addr]` permission flag, the node will get the addresses https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3589[directly from AddrMan] (addresses manager) and the response message will contain random records with the most up-to-date information.
+
+But if the peer has not the `addr` permission, the addresses will be https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3591[retrieved from a cache] that stores the responses to `GETADDR` on a daily basis, so that an attacker gets at most 1,000 records per day and can’t track the changes in real time.
+
+This https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L1149[cache] was implemented in the https://github.com/bitcoin/bitcoin/pull/18991[PR #18991] to prevent an attacker from making multiple `GETADDR` requests to scrape the node’s AddrMan (a database of all nodes known to it along with the timestamps) and then, infer the victim's direct peers and the network topology. By caching the same response for 24 hours, the attacker will receive the same response during that time, and the attack will then be neutralized.
+
+Finally, the addresses are inserted into the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L549[pfrom.vAddrToSend]` vector using the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L676[pfrom.PushAddress()]` method.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::GETADDR) {
+        if (!pfrom.IsInboundConn()) {
+            LogPrint(BCLog::NET, "Ignoring \"getaddr\" from %s connection. peer=%d\n", pfrom.ConnectionTypeAsString(), pfrom.GetId());
+            return;
+        }
+
+        if (pfrom.fSentAddr) {
+            LogPrint(BCLog::NET, "Ignoring repeated \"getaddr\". peer=%d\n", pfrom.GetId());
+            return;
+        }
+        pfrom.fSentAddr = true;
+
+        pfrom.vAddrToSend.clear();
+        std::vector<CAddress> vAddr;
+        if (pfrom.HasPermission(PF_ADDR)) {
+            vAddr = m_connman.GetAddresses(MAX_ADDR_TO_SEND, MAX_PCT_ADDR_TO_SEND);
+        } else {
+            vAddr = m_connman.GetAddresses(pfrom, MAX_ADDR_TO_SEND, MAX_PCT_ADDR_TO_SEND);
+        }
+        FastRandomContext insecure_rand;
+        for (const CAddress &addr : vAddr) {
+            pfrom.PushAddress(addr, insecure_rand);
+        }
+        return;
+    }
+    // ...
+}
+----
+
+[[summary]]
+=== Summary
+
+When a node successfully establishes an outbound full relay connection, it tries to https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2484[send its own address] and a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2493[`GETADDR` message to the peer].
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L78[ADDR]` or `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L84[ADDRV2]` is the reply to `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L135[GETADDR]` messages but it can also be sent unsolicited. The first `ADDR` message usually contains 1000 addresses, and they will https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2708[not be relayed]. Subsequent `ADDR` messages contains fewer addresses, and these can be https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L1565[relayed to 1 or 2 peers].
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4153[MaybeSendAddr()]` is the function that https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4181[decides if the addresses will be sent] to a peer or not. This is controlled by `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L553[node.m_next_addr_send]` variable, which represents the https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L4183[next time] the node will announce all the addresses it knows.
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L135[GETADDR]` messages ask the connected peer for information about other active peers. If the node receives this message on an outbound connection or https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3580[more than once from the same peer], the message is ignored.
+
+There are two ways to build the addresses to be sent. If the requesting peer has the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_permissions.h#L34[addr]` permission flag, the node will get the addresses https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3589[directly from AddrMan]. Otherwise, the addresses will be https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L3591[retrieved from a cache] that stores the responses to `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.h#L135[GETADDR]` daily. This improves privacy.
+
+`https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L182[ADDR_FETCH]` connections are https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net_processing.cpp#L2722[short lived connections] used to solicit addresses from peers. https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1722[These are initiated to addresses] submitted via the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/init.cpp#L451[-seednode]` command line argument.
+
+The following table summarizes the messages related to the addresses relay that each type of connection can handles.
+
+The `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L460[fSentAddr]` flag ensures that the node will ignore repeated `GETADDR` messages.
+
+The other flag that was menitoned in this text, `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L551[fGetAddr]`, does not appeat in the table because it only prevents the first `ADDR` or `ADDRV2` message received from a new outbound peer to be relayed to others. It has no effect on disabling or enabling message handling.
+
+|===
+.3+^.^| Connection Type 4+^| Messages
+2+^| fSentAddr = false 2+^| fSentAddr = true
+^| Send	^| Receive ^| Send ^| Receive
+| INBOUND | `ADDR` `ADDRV2` `SENDADDRV2` | `GETADDR` | `ADDR` `ADDRV2` | `ADDR` `ADDRV2`
+| OUTBOUND FULL RELAY | `GETADDR` `SENDADDRV2` | `ADDR` `ADDRV2` `SENDADDRV2` | `ADDR` `ADDRV2` | `ADDR` `ADDRV2`
+| MANUAL | `GETADDR` `SENDADDRV2` | `ADDR` `ADDRV2` `SENDADDRV2` | `ADDR` `ADDRV2` | `ADDR` `ADDRV2`
+| FEELER 4+| 
+| BLOCK RELAY 4+|
+| ADDR FETCH | `GETADDR` `SENDADDRV2` | `ADDR` `ADDRV2` `SENDADDRV2` 2+|
+
+|=== 
+
+[[references]]
+=== References
+
+* https://github.com/bitcoin-core/bitcoin-devwiki/wiki/Addrman-and-eclipse-attacks[Addrman and eclipse attacks]
+
+* https://github.com/bitcoin/bips/blob/master/bip-0155.mediawiki[BIP 155]
+
+* https://developer.bitcoin.org/devguide/p2p_network.html[Bitcoin Developer - P2P Network]
+
+* https://github.com/amitiuttarwar/bitcoin-notes/blob/main/scale-block-relay-only.png[Scale Block Relay Only]

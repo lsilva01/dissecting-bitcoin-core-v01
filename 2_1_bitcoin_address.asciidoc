@@ -1,0 +1,296 @@
+[[bitcoin-address]]
+== 2.1. Bitcoin Address
+
+The way Bitcoin Core generates addresses have changed significantly since the book _A Dissection of Bitcoin_ was written.
+
+The Bitcoin Core wallet was originally a collection of unrelated private keys with their associated addresses. If a non-HD wallet generated a key/address, gave that address out and then restored a backup from before that key's generation, then any funds sent to that address would be lost definitively.
+
+The  https://github.com/bitcoin/bitcoin/commit/10384941[commit 10384941] changed it, implementing the https://github.com/bitcoin/bitcoin/commit/10384941#diff-122b8ef2d7c660078589034d38fcf2062ecf3ea90f5ec82fc307b54cbf6cc46dR311[Keypool], a class that stores a list of the public keys. The wallet would generate a set of keys (100 by default). When a new public key was required, either to give out as an address or to use in a change output, it would be drawn from the keypool. The keypool would then be topped up to maintain 100 keys. This ensured that as long as the wallet hadn't used more than 100 keys since the previous backup, all funds would be safe, since a restored wallet would be able to scan for all owned addresses.
+
+The original function `CAddressBookDialog::OnButtonNew(...)`  that is mentioned in the book calls the `GenerateNewKey()` to get the new address. But after the aforementioned commit, the `CAddressBookDialog::OnButtonNew(...)` has started using `WalletDB().GetKeyFromKeyPool()` to get the public key and convert it to the address format, as can be seen at the https://github.com/bitcoin/bitcoin/commit/10384941#diff-69ad7eaa885098e9e2671dd715feada841799255c0caa06e07d9bf6e1307595eR2567-R2568[git diff].
+
+
+With the introduction of HD wallets (commit: https://github.com/bitcoin/bitcoin/commit/f1902510[f1902510]), the keypool essentially became an address look-ahead pool. Restoring old backups can no longer definitively lose funds as long as the addresses used were from the wallet's HD seed (since all private keys can be rederived from the seed).
+
+However, if many addresses were used since the backup, then the wallet may not know how far ahead in the HD chain to look for its addresses. The keypool is used to implement a 'gap limit'. The keypool maintains a set of keys (by default 1000) ahead of the last used key and scans for the addresses of those keys.  This avoids the risk of not seeing transactions involving the wallet's addresses, or of re-using the same address.
+
+In the unlikely case where none of the addresses in the `gap limit` are used on-chain, the look-ahead will not be incremented to keep a constant size and addresses beyond this range will not be detected by an old backup.
+
+More information about Keypool can be found in the description of the class.
+
+In current implementation, to request a new address to receive coins, the user clicks on the button `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/forms/receivecoinsdialog.ui#L111[Create new receiving address]` of the `Receive` tab. The file that handles this screen is the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/receivecoinsdialog.cpp[src/qt/receivecoinsdialog.cpp]`. 
+
+The button triggers the function `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/receivecoinsdialog.cpp#L142[void ReceiveCoinsDialog::on_receiveButton_clicked()]`  in the `receivecoinsdialog.cpp` file that generate a new address and add it to the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/addresstablemodel.h[AddressTableModel]` of the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/walletmodel.h#L80[WalletModel]`. If the new address is successfully added, a `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/receiverequestdialog.h[ReceiveRequestDialog]` is displayed.
+
+[source,c++]  
+---- 
+void ReceiveCoinsDialog::on_receiveButton_clicked()
+{
+    // ...
+
+    OutputType address_type;
+    if (ui->useBech32->isChecked()) {
+        address_type = OutputType::BECH32;
+    } else {
+        address_type = model->wallet().getDefaultAddressType();
+        if (address_type == OutputType::BECH32) {
+            address_type = OutputType::P2SH_SEGWIT;
+        }
+    }
+
+    address = model->getAddressTableModel()->addRow(AddressTableModel::Receive, label, "", address_type);
+
+    switch(model->getAddressTableModel()->getEditStatus())
+    {
+    case AddressTableModel::EditStatus::OK: {
+        // Success
+        SendCoinsRecipient info(address, label,
+            ui->reqAmount->value(), ui->reqMessage->text());
+        ReceiveRequestDialog *dialog = new ReceiveRequestDialog(this);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setModel(model);
+        dialog->setInfo(info);
+        dialog->show();
+
+        /* Store request for later reference */
+        model->getRecentRequestsTableModel()->addNewRequest(info);
+        break;
+    }
+    // ...
+}
+----
+
+In this code, there are two key points: 
+
+1. The output type (`address_type`) is set depending on whether the user checked the bech32 option in the GUI or on the default address type of the wallet.
+2. Based on this `address_type`, a new address is generated.
+
+=== OutputType
+
+Bitcoin protocol has 3 types of address: LEGACY (or P2PKH), P2SH_SEGWIT or BECH32. They are represented in the https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/outputtype.h#L17[enum class OutputType] in the file https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/outputtype.h[src/outputtype.h].
+
+[source,c++]  
+---- 
+enum class OutputType {
+    LEGACY,
+    P2SH_SEGWIT,
+    BECH32,
+};
+----
+
+P2PKH or Legacy address (old address format) is the first version of a Bitcoin address and it starts with the number "1".In this format, first the public key is hashed with SHA256 and the result is then hashed with RIPEMD160. The public key hash is encoded with Base58Check with a truncated double-SHA256 checksum.
+
+    base58-encode: RIPEMD160(SHA256(publicKey))
+
+Pay to script hash (P2SH) address format were standardised in https://github.com/bitcoin/bips/blob/master/bip-0013.mediawiki[BIP 13].  P2SH address always begins with a '3', instead of a '1' as in P2PKH addresses. This is because P2SH addresses have a version byte prefix of 0x05, instead of the 0x00 prefix in P2PKH addresses, and these come out as a '3' and '1' after base58check encoding. This format also represents the encoded hash of a script, rather than the encoded hash of an ECDSA public key. 
+
+    base58-encode: RIPEMD160(SHA256(redeemScript))
+
+.Why base-58 instead of standard base-64 encoding?
+[NOTE]
+===============================
+* Don't want 0OIl characters that look the same in some fonts and could be used to create visually identical looking data.
+* A string with non-alphanumeric characters is not as easily accepted as input. + 
+* Double-clicking selects the whole string as one word if it's all alphanumeric.
+===============================
+
+BECH32 is a segwit address format specified by https://github.com/bitcoin/bips/blob/master/bip-0173.mediawiki[BIP 0173]. This address format is also known as "bc1 addresses". It is encoded using _BECH32_ instead of base58check and the witness program is `Hash160(pubkey)` for P2WPKH, and `Hash256(witness_script)` for P2WPKH. For native segwit outputs the scriptPubKey is `OP_0 <witness_program>``; for P2SH-wrapped segwit outputs the redeemScript is `OP_0 <witness_program>`. More details in https://bitcoin.stackexchange.com/a/95236[this answer in the bitcoin.stackexchange ].
+
+    bech32: ["bc"][witness version] base32:[witness program]
+
+An interesting point about the segwit address format is that `Hash160` is _not_ used when address is originated from script, only from a public key. Why ? +
+Both `P2PKH` and `P2WPKH` have 160-bit hashes and since only a single key is involved from one party, we need only be concerned with preimage collisions, for which it has a 160-bit level of security. Anything over 100 bits is considered secure. +
+`P2SH` (3... addresses) hash 160-bit hashes and if the script all the keys are fully created by the same person, is the same case mentioned above: 160-bits of security from preimage resistance. However for general classes of scripts and when there are multiple people involved, collision attacks may be possible which reduce security thresholds to a 2^80 bits of work, which is concerning even if it is not (currently) feasible. +
+`P2WSH` (bech32, version 0, 32 bytes) is like the segwit version of `P2SH`, but instead of using `RIPEMD-160` as the last step, it uses SHA-256, resulting in a 256-bit hash. It therefore has 128 bits of collision resistance out of the box, making any script secure from hash collisions no matter the protocol used to construct it. +
+More details about this interesting question can be found in the _u/maaku7's_ https://www.reddit.com/r/Bitcoin/comments/74tonn/bech32_native_segwit_address_already_used_on_the/dqlogru/[informative answer]  in Reddit. 
+
+.Why Bech32 instead of standard base-58 encoding?
+[NOTE]
+===============================
+* Base58 needs a lot of space in QR codes, as it cannot use the alphanumeric mode.
+* The mixed case in base58 makes it inconvenient to reliably write down, type on mobile keyboards, or read out loud.
+* The double SHA256 checksum is slow and has no error-detection guarantees.
+* Most of the research on error-detecting codes only applies to character-set sizes that are a prime power, which 58 is not.
+* Base58 decoding is complicated and relatively slow.
+===============================
+
+At the time the book _A Dissection of Bitcoin_ was written, there was only one address type, the LEGACY / P2PKH. This can be seen in the code snippet below (located in the page 11):
+
+    mapPubKeys[Hash160(key.GetPubKey())]= key.GetPubKey()
+
+In the version 0.21, there's a checkbox `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/forms/receivecoinsdialog.ui#L198[Generate native segwit (Bech32) address]` that allows user to opt for non-segwit address if the checkbox is unchecked.
+In that case, the wallet default address type will be chosen. If the default address type is also Bech32, the 
+P2SH_SEGWIT type will be selected. The code snippet below shows this functionality.
+
+[source,c++]  
+---- 
+if (ui->useBech32->isChecked()) {
+    address_type = OutputType::BECH32;
+} else {
+    address_type = model->wallet().getDefaultAddressType();
+    if (address_type == OutputType::BECH32) {
+        address_type = OutputType::P2SH_SEGWIT;
+    }
+}
+----
+
+Now let's explore the second key point: the address generation.
+It happens in the function `model->getAddressTableModel()->addRow(AddressTableModel::Receive, label, "", address_type)`, that we will see in more detail to understand how the new address is generated.
+
+=== Legacy and Descriptor Wallets
+
+The way the addresses will be generated depends on the type of wallet, or more precisely, the type of script pubkey used. Since 0.21, Bitcoin Core has had two types of wallet: _legacy_ and _descriptor_.
+
+Descriptor Wallets store Output Script Descriptors in the wallet and use these to generate the addresses that users can use. Legacy Wallets (the non-descriptor wallet type, and the only type of wallet previous versions would create) instead used private keys to generate addresses. More details about the motivation to implement the can be foun in this https://achow101.com/2020/10/0.21-wallets[article] by Andrew Chow.
+
+
+The function `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/addresstablemodel.cpp#L343[QString AddressTableModel::addRow(…)]` of the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/qt/addresstablemodel.cpp[src/qt/addresstablemodel.cpp]` calls `walletModel->wallet().getNewDestination(address_type, strLabel, dest)` to generate the new receive address.
+
+[source,c++]  
+---- 
+QString AddressTableModel::addRow(const QString &type, const QString &label, const QString &address, const OutputType address_type)
+{
+    // ...
+    if(type == Send)
+    {
+        // ...
+    }
+    else if(type == Receive)
+    {
+        // Generate a new address to associate with given label
+        CTxDestination dest;
+        if(!walletModel->wallet().getNewDestination(address_type, strLabel, dest))
+        {
+            // handle failure
+        }
+        strAddress = EncodeDestination(dest);
+    }
+    else
+    {
+        return QString();
+    }
+    return QString::fromStdString(strAddress);
+}
+---- 
+
+The function bool `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/wallet.cpp#L3323[Cwallet::GetNewDestination(…)]` of the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/wallet.cpp[src/wallet/wallet.cpp]` file calls `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/wallet.cpp#L4308[GetScriptPubKeyMan(type, false /* internal */)]`, that try to find a scriptPubKey Manager for the wallet. If the wallet is legacy it will return `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.h#L256[LegacyScriptPubKeyMan]` class. If it is descriptor, the class `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.h#L516[DescriptorScriptPubKeyMan]` will be returned. Both classes are subclasses of the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.h#L168[ScriptPubKeyMan]`.
+
+Then the method `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1597[DescriptorScriptPubKeyMan::GetNewDestination(...)]` or `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L18[LegacyScriptPubKeyMan::GetNewDestination(...)]` will be called depending of the `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.h#L168[ScriptPubKeyMan]` subclass.  
+
+[source,c++]  
+---- 
+bool CWallet::GetNewDestination(const OutputType type, const std::string label, CTxDestination& dest, std::string& error)
+{
+    // ...
+    auto spk_man = GetScriptPubKeyMan(type, false /* internal */);
+    if (spk_man) {
+        spk_man->TopUp();
+        result = spk_man->GetNewDestination(type, dest, error);
+    } else {
+        error = strprintf("Error: No %s addresses available.", FormatOutputType(type));
+    }
+    if (result) {
+        SetAddressBook(dest, label, "receive");
+    }
+
+    return result;
+}
+----
+=== LegacyScriptPubKeyMan::GetNewDestination
+
+If the wallet is legacy, the method used to get a new key will be `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L18[LegacyScriptPubKeyMan::GetNewDestination]`, that calls three functions: `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1324[GetKeyFromPool]`, `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1392[LearnRelatedScripts]` and `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/outputtype.cpp#L49[GetDestinationForKey]`.
+
+[source,c++]  
+---- 
+bool LegacyScriptPubKeyMan::GetNewDestination(const OutputType type, CTxDestination& dest, std::string& error)
+{
+    LOCK(cs_KeyStore);
+    error.clear();
+
+    // Generate a new key that is added to wallet
+    CPubKey new_key;
+    if (!GetKeyFromPool(new_key, type)) {
+        error = _("Error: Keypool ran out, please call keypoolrefill first").translated;
+        return false;
+    }
+    LearnRelatedScripts(new_key, type);
+    dest = GetDestinationForKey(new_key, type);
+    return true;
+}
+----
+
+`https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1324[GetKeyFromPool]` is a method of `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.h#L256[LegacyScriptPubKeyMan]` class and fetches a key from the keypool through the method `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1346[ReserveKeyFromKeyPool]`. If this one fails (empty keypool) or the wallet contains no HD seed, no private keys or no scripts (flag `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/walletutil.h#L47[WALLET_FLAG_DISABLE_PRIVATE_KEYS]`), it calls `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L18[LegacyScriptPubKeyMan::GenerateNewKey(...)]`, which is a very interesting method. Here the new keys will be created. If HD Wallet is enabled, `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1057[LegacyScriptPubKeyMan::DeriveNewChildKey(...)]` is called to get keys. Else it calls `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/key.cpp#L157[CKey::MakeNewKey(...)]`.
+
+[source,c++]  
+---- 
+bool LegacyScriptPubKeyMan::GetKeyFromPool(CPubKey& result, const OutputType type, bool internal)
+{
+   // ...
+        if (!ReserveKeyFromKeyPool(nIndex, keypool, internal) && !m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            // ...
+            result = GenerateNewKey(batch, m_hd_chain, internal);
+            return true;
+        }
+    //..
+    return true;
+}
+---- 
+
+[source,c++]  
+---- 
+CPubKey LegacyScriptPubKeyMan::GenerateNewKey(WalletBatch &batch, CHDChain& hd_chain, bool internal)
+{
+    // ...
+
+    // use HD key derivation if HD was enabled during wallet creation and a seed is present
+    if (IsHDEnabled()) {
+        DeriveNewChildKey(batch, metadata, secret, hd_chain, (m_storage.CanSupportFeature(FEATURE_HD_SPLIT) ? internal : false));
+    } else {
+        secret.MakeNewKey(fCompressed);
+    }
+
+    // ...
+
+    return pubkey;
+}
+---- 
+
+// Increase the coverage of ---- GenerateNewKey(): LegacyScriptPubKeyMan::IsHDEnabled(), LegacyScriptPubKeyMan::DeriveNewChildKey() and CKey::MakeNewKey() methods.
+
+
+
+`https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/wallet/scriptpubkeyman.cpp#L1392[LearnRelatedScripts]` makes the wallet learn the related scripts for outputs to the given key. This is purely to make the wallet file compatible with older software.
+
+`https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/outputtype.cpp#L49[GetDestinationForKey]`  gets a destination (address) of the requested type (if possible) to the specified key. Examples of types are `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/script/standard.h#L142[PKHash]`, `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/script/standard.h#L172[WitnessV0KeyHash] (Segwit)` or `https://github.com/bitcoin/bitcoin/blob/v0.21.0/src/script/standard.h#L152[ScriptHash]`.
+
+[source,c++]  
+---- 
+CTxDestination GetDestinationForKey(const CPubKey& key, OutputType type)
+{
+    switch (type) {
+    case OutputType::LEGACY: return PKHash(key);
+    case OutputType::P2SH_SEGWIT:
+    case OutputType::BECH32: {
+        if (!key.IsCompressed()) return PKHash(key);
+        CTxDestination witdest = WitnessV0KeyHash(key);
+        CScript witprog = GetScriptForDestination(witdest);
+        if (type == OutputType::P2SH_SEGWIT) {
+            return ScriptHash(witprog);
+        } else {
+            return witdest;
+        }
+    }
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+---- 
+
+The destination (address) is stored in a variable called `dest` and it finishes the legacy wallet workflow.
+
+=== DescriptorScriptPubKeyMan::GetNewDestination
+
+`DescriptorScriptPubKeyMan::GetNewDestination(...)` is simpler. It gets the scriptPubKey from the descriptor and calls `ExtractDestination(scriptPubKey, ...)`, that gets the TxoutType of the scriptPubKey (`PUBKEYHASH`, `SCRIPTHASH`, `WITNESS_V0_SCRIPTHASH`, etc ...) and finally gets the destination (address) for the type and it finishes the descriptor wallet workflow.
+
+=== Finishing the Adresses Generation
+
+If the `ScriptPubKeyMan::GetNewDestination(...)`` returns true (what indicates successful operation), the Cwallet::GetNewDestination(…) calls SetAddressBook(dest, label, "receive")., 
