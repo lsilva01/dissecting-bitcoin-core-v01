@@ -1,0 +1,716 @@
+[[addrman]]
+== AddrMan
+
+The Bitcoin peer-to-peer layer supports messages that allow nodes to gossip the addresses of other nodes on the network. This allows new nodes coming online to learn of other peers, and new listening nodes (that are able to take incoming connections) can have their address gossiped so that other nodes can connect to them later.
+
+Bitcoin Core tracks and stores addresses using a component known as address manager or AddrMan, implemented in the class `CAddrMan`, introduced in the https://github.com/bitcoin/bitcoin/pull/787[PR #787]. AddrMan maintains known addresses (e.g. IP, I2P and onion) of bitcoin peers on the network. While the implementation has undergone several changes, namely increasing the number of buckets for each table, the essential design remains the same.
+
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference for the project’s codebase at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 6d1d33d33491
+
+[[original_implementation]]
+=== Original Implementation
+
+In the early versions (before v0.6.0), Bitcoin Core had a much simpler mechanism for storing addresses of known peers. At that time, when the node https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/main.cpp#L1989[received new addresses] from `ADDR` message, they are added to the global variable `https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/net.cpp#L458[mapAddresses]` and to the `https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/net.cpp#L489-L492[addr.dat]` BerkeleyDB 4.8 database. Old addresses https://github.com/bitcoin/bitcoin/blob/v0.5.3rc4/src/main.cpp#L2577[were cleared] periodically.
+
+Since v0.6.0, there has been an addresses manager (also known as AddrMan) implemented in the https://github.com/bitcoin/bitcoin/pull/787[PR #787]. This change also introduced a much more refined control of address management. Two new tables were created, `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L191[tried]` and `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L197[new]`. 
+
+Originally, the `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L191[tried]` table consisted of https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L124[64 buckets], each of which could https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L348[store up to 64 unique addresses] for peers to whom the node had https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/main.cpp#L3493-L3498[successfully established] an incoming or outgoing connection. Along with each stored peer’s address, the node kept the https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L280-L282[timestamp] for the most recent successful connection to this peer.
+
+Each peer’s address was mapped to a bucket in `tried` table by taking the hash of the peer’s https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L17[_(a) IP address_] and https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L22[_(b) group_], where the group defined is https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/netbase.cpp#L808[the /16 IPv4 prefix] containing the peer’s IP address.
+
+The `https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L197[new]` table consisted of https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.h#L130[256 buckets],  each  of  which  could  https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L363[hold  up  64  addresses  for  peers] to whom the node had not yet initiated a successful connection.  A node populates the `new` table with information learned from the https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/net.cpp#L1201[DNS seeders], or from https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/main.cpp#L3590[`ADDR` messages].   Addresses  in  the `new` table  also  have  an  associated timestamp;  addresses learned from DNS seeders were stamped with a random timestamp https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/net.cpp#L1196[between 3 and 7 days old], while addresses learned from `ADDR` messages are  stamped  with  their  timestamp  from  the `ADDR` message https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/main.cpp#L3590[plus two hours].
+
+Every address inserted in `new` table belonged to (1) a https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L29[_group_] (the /16 IPv4 prefix of the peer’s IP address) and (2) a https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/addrman.cpp#L30[_source group_] which contains the  /16 IPv4 prefix of the connected peer or DNS seeder from which the node learned about that address.
+
+In the PR version 7.0 (https://github.com/bitcoin/bitcoin/pull/1198[PR #1198]), the BerkeleyDB-managed `addr.dat` was replaced with a flat file called `peers.dat` to store the AddMan data. Later, in the commit https://github.com/bitcoin/bitcoin/pull/8085/commits/d93b14dc5ddfb937b0cc18be425b9d048cefb66b[d93b14d] (from https://github.com/bitcoin/bitcoin/pull/8085[PR #8085]), CAddrDB were moved out of `src/net.{h,cpp}` to `src/addrdb.{h,cpp}`.
+
+[[eclipse_attack]]
+=== Eclipse Attack
+
+On August 2015, the research https://eprint.iacr.org/2015/263.pdf[_Eclipse Attacks on Bitcoin’s Peer-to-Peer Network_] presented the _Eclipse Attack_, which allows an adversary controlling a sufficient number of IP addresses to monopolize all connections to and from a victim bitcoin node. The attacker can then  exploit  the  victim  for  attacks  on  bitcoin’s  mining and consensus system, including double spending,  selfish  mining,  and  adversarial  forks  in  the blockchain.
+
+[[deployed_eclipse]]
+=== Deployed Countermeasures for Eclipse Attacks
+
+This paper analysed the AddrMan functionality and recommended 10 countermeasures. As consequence, some important changes have been made in the network-handling code of Bitcoin protocol. Deployed countermeasures are presented below in chronological order of when they were merged into Bitcoin Core.
+
+[[eclipse_c4]]
+=== Countermeasure 4: Feeler Connections
+
+The research found that a large percentage of addresses in tried tables are stale IP addresses (ranging from 72% to 95% stale), which increases the risk of eclipse attacks.
+
+In the https://github.com/bitcoin/bitcoin/pull/8282[PR #8282] the countermeasure 4 (Feeler Connections) was added to the code. A Feeler connection is an outgoing connection that establish short-lived test connections to randomly selected addresses in `new`. If connection succeeds, the address is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2512[moved from `new` to `tried`]; otherwise, the address https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L319[is evicted from `new`].
+
+Feeler connections confirm the peer's addresses stored in the `new` table are online by https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1933[doing] the VERSION/VERACK handshake before https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2535[disconnecting] and moving them to `tried` table. This test ensures that the `tried` table is replenished with a steady supply of recent online addresses.
+
+https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L70[Only one feeler connection] is attempted at any one time and feeler connections are only attempted after https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1898-L1934[all outgoing connections slots are filled]. To limit the network impact of the feeler connections nodes make one new connection every https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[2 minutes]. Compared with other networking tasks that bitcoind performs the bandwidth increase is very slight. To avoid issues of synchronization there is a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L2032[random sleep] of between 0 and 1000 milliseconds prior to making a feeler connection. To avoid threading issues the feeler connections are made in the https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1772[same thread] as non-feeler connections.
+
+[[eclipse_c3]]
+=== Countermeasure 3: test-before-evict
+
+Before storing an address in its (deterministically-chosen) slot in a bucket in `tried`, first check if there is an https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L249[older address stored in that slot].  If so, a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1966-L1969[short-lived connection], also referred to as a feeler connection, attempts to https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1969[connect to the older address], and if connection is successful, then the older address is not evicted from the `tried` table; the new address is stored in `tried` only https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L577[if the connection fails].
+
+Another small side advantage of _test-before-evict_ is that https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L253[no more than ten addresses] can be in the test buffer at once (defined in https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.h[ADDRMAN_SET_TRIED_COLLISION_SIZE] constant). 
+
+Addresses are only cleared https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L630[one at a time] from the test buffer and since https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1966-L1969[this is a feeler connection], so an attacker is forced https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[to wait at least two minutes] to insert a new address into the `tried` table after filling up the test buffer. This rate limits an attacker attempting to launch an eclipse attack.
+
+This countermeasure was implemented in the https://github.com/bitcoin/bitcoin/pull/9037[PR 9037].
+
+[[eclipse_c1]]
+=== Countermeasure 1: Deterministic random eviction
+
+In the https://github.com/bitcoin/bitcoin/pull/5941[PR #5941], the countermeasures 1, 2 and 6 were implemented.
+
+The commit https://github.com/bitcoin/bitcoin/commit/e6b343d880f50d52390c5af8623afa15fcbc65a2[e6b343d] implements the countermeasures 1: when adding an address to the `new` or `tried` tables, each address deterministically hashes to a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L35[single slot] in a single bucket. Before this change, an attacker could increase the number of addresses stored by repeatedly inserting the same address in multiple rounds. This update gave each address a single fixed location in the new and tried tables, which become simple https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.h#L218-L224[fixed-size arrays] instead of sets and vectors.
+
+[[eclipse_c2]]
+=== Countermeasure 2: Random selection
+
+The commit https://github.com/bitcoin/bitcoin/commit/f68ba3f67bd500a64fb8932c6b41924ddc31d76f[f68ba3f] implements the countermeasures 2: The Eclipse paper's attack exploited bitcoin core’s heavy bias towards initiating outgoing connections to addresses with fresh timestamps. This advantage was eliminated when addresses were https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L368[selected at random] from `tried` and `new` tables. 
+
+[[eclipse_c6]]
+=== Countermeasure 6: More buckets
+
+As more buckets are added, an infrastructure attacker needs to increase the number of groups in order to expect to fill the same fraction of the tried table. The commit https://github.com/bitcoin/bitcoin/pull/5941/commits/1d21ba2f5ecbf03086d0b65c4c4c80a39a94c2ee[1d21ba2] added https://github.com/bitcoin/bitcoin/pull/5941/commits/1d21ba2f5ecbf03086d0b65c4c4c80a39a94c2ee#diff-164bd9e2e30f54d0a79eb7cc372309e2f2155edc6c3f051290ab078f03f6a771L130-R146[more buckets and the addresses saved per group were scaled].
+
+Importantly, however,  this  countermeasure  is  helpful  only  when `tried` already contains many legitimate addresses,  so that attacker owns a smaller fraction of the addresses in `tried`. 
+
+However, if `tried` is mostly empty (or contains mostly stale addresses for nodes that are no longer online), the attacker will still own a large fraction of the addresses in `tried`,  even  though  the  number  of `tried` buckets has  increased.   
+
+Thus,  this  countermeasure  is only effective if accompanied by others, such as feeler connections and _test-before-evict_ which increase the number of legitimate addresses stored in `tried`
+
+[[eclipse_c5]]
+=== Countermeasure 5: Anchor connections
+
+Inspired by Tor https://www-users.cs.umn.edu/~hoppernj/single_guard.pdf[entry guard rotation rates], the Eclipse Attack paper recommends adding connections that persist between restarts, known as anchor connections. These long-lasting connections make Eclipse Attack more expensive for the attackers but at the cost of privacy concerns of leaking network topology or transaction sources.
+
+The https://github.com/bitcoin/bitcoin/pull/17428[PR #17428] implements this countermeasure. But instead of adding anchor connections for full-relay connections, this PR scopes anchor connections to block-relay-only connections to help with the privacy concerns stated above. Therefore, the node https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrdb.cpp#L161-L178[persists block-relay-only connections] in the `anchors.dat` file when restarted and attempts to initiate these connections https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1946-L1955[from the peers stored] in the file.
+
+The https://github.com/bitcoin/bitcoin/issues/17326[issue #17326] has some interesting discussion about this countermeasure implementation.
+
+[[undeployed_eclipse]]
+=== Undeployed (or partially deployed) countermeasures
+
+[[eclipse_c7]]
+=== Countermeasure 7: More outgoing connections
+
+The eclipse attack paper recommended adding, "additional outgoing connections without risking that the network will run out of connection capacity."
+
+Version 0.19 added two outbound block-relay-only connections via https://github.com/bitcoin/bitcoin/pull/15759[PR #15759], which do not relay or process transactions or addr messages. This was motivated by the https://arxiv.org/pdf/1812.00942.pdf[TxProbe paper]. Fundamentally, transaction-relay is going to leak information about the node's peers and allows an observer to infer network topology. But block-relay-only connections are much harder to observe than their transaction-relay counterparts.
+
+When considering the addition of more outbound connections by default, there exists a fundamental tradeoff between resource minimization and robustness to peer misbehavior. Adding more connectivity to the network graph makes Bitcoin's network more robust (e.g., to eclipse or partition attacks), but at the cost of more resource utilization.
+
+There are other promising solutions like the https://github.com/bitcoin/bitcoin/pull/21515[Erlay], which improves the bandwidth efficiency of relaying unconfirmed transactions between Bitcoin full nodes.
+
+[[eclipse_c8]]
+=== Countermeasure 8: Ban unsolicited ADDR messages
+
+Currently, unsolicited ADDR messages of https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2708[greater than 10 addresses] are accepted but not relayed. A node could choose not to accept large unsolicited ADDR messages from incoming peers and only solicit ADDR messages from outgoing connections when its new table is near empty. This prevents adversarial incoming connections from flooding a victim's new table with useless or malicious addresses. The tradeoff would be the slower propagation of addresses from new nodes across the network.
+
+[[eclipse_c9]]
+=== Countermeasure 9: Diversify incoming connections
+
+A Bitcoin node can have all of its incoming connections comefrom the same IP address, making it far too easy for a single computer to monopolize a victim’s incoming connections during an eclipse attack or connection-starvation attack. The eclipse attack paper suggests a node accepts only a limited number of connections from the same IP address.
+
+[[eclipse_c10]]
+=== Countermeasure 10: Anomaly detection
+
+The eclipse attack can have several specific patterns that make it detectable, including: (1) a flurry of short-lived incoming TCP connections from diverse IP addresses that send large ADDR messages containing "trash" IP addresses. (2) An attacker that suddenly connects a large number of nodes to the network. (3) As could one that uses eclipsing to decrease the network's mining power dramatically. +
+Monitoring and anomaly detection systems that look for this behavior would be useful. They would, at the very least, force an eclipse attacker to attack at a lower rate or waste resources on overwriting new, rather than useless, IP addresses.
+
+[[erebus_attack]]
+=== Erebus Attack
+
+Erebus attack allows large malicious Internet Service Providers (ISPs) to isolate any targeted public Bitcoin nodes from the Bitcoin peer-to-peer network. The Erebus attack does not require routing manipulation (e.g., BGP hijacks) and hence it is virtually undetectable to any control-plane and even typical data-plane detectors. +
+By partitioning some Bitcoin nodes, an adversary can launch many serious attacks, including attacking Bitcoin consensus, double-spending or 51% mining attacks. 
+
+This research considers a network adversary who has full control of a single AS (autonomous system) network. The adversary may arbitrarily insert/modify/remove/delay any messages traversing the network. Note that typical nation-state adversaries may have such network capability. The adversary’s goal is to control all the peer connections of a target node in the Bitcoin peer-to-peer network.
+
+[[deployed_erebus]]
+=== Deployed Countermeasures for Erebus Attack
+
+Originally, the peers' addresses were stored based on their groups which were defined by the /16 IPv4 prefix of the address. 
+
+Bitcoin Core originally store the peer's address using the group which was defined by https://github.com/bitcoin/bitcoin/blob/v0.9.3/src/netbase.cpp#L808[the /16 IPv4 prefix] of its address.  Since the EREBUS adversary has a very large bandwidth capacity and a significantly large number of IP addresses, it could generate enough IPs to fill the tables and isolate the victims' network. Thus, four countermeasures have been proposed to mitigate the attack. Two of them have already been adopted.
+
+[[erebus_c2]]
+=== Countermeasure 2: More outgoing connections
+
+Increasing the number of outgoing connections also makes Erebus attack significantly harder to occupy all the outgoing connections. Since Bitcoin v0.19.0, there are 10 outgoing connections in total (or 11, considering the feeler connection).
+
+The https://github.com/bitcoin/bitcoin/pull/15759[PR #15759] added 2 outbound https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1898-L1930[block-relay-only connections]. This PR was motivated by the https://arxiv.org/pdf/1812.00942.pdf[TxProbe paper]. The idea is to separate block relay from transaction relay; inferring network connectivity from the relay of blocks/block headers is much more expensive for an adversary.
+
+By increasing the number of connections, this change met countermeasure 2.
+
+[[erebus_c3]]
+=== Countermeasure 3:  Selecting peers with AS topology information
+
+Incorporating AS topology in the peer selection can make attack becomes harder or impossible for the adversaries with IPs distributed in a large number of prefix groups but hosted in a few ASes only. Since Bitcoin v0.20.0, ASN-based grouping is included as a non-default setting.
+
+The https://github.com/bitcoin/bitcoin/pull/16702[PR #16702] implemented this change. Instead of relying on /16 prefix to diversify the connections every node creates, we would instead https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/netaddress.cpp#L792-L801[rely on the (ip -> ASN) mapping], if this mapping https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L1272-L1295[is provided].
+
+The `.map` file is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L104[included in the release], but it also can be created by every user independently via `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L425[-asmap=<file>]` initialization parameter.
+
+[[undeployed_erebus]]
+=== Undeployed countermeasures
+
+[[erebus_c1]]
+=== Countermeasure 1: Table size reduction
+
+Reducing the size of the two tables storing peer IPs makes Erebus attack less effective because the adversary has much larger bandwidth capability and significantly more IP addresses than legitimate peers.
+
+[[erebus_c4]]
+=== Countermeasure 4: Smarter eviction policy
+
+An improved peer eviction policy that protects peers providing fresher block data will make censoring a specific block or transaction from the victim's view becomes less effective if there exists a legitimate incoming connection providing fresher blocks.
+
+.Increase or decrease the size of the `new` and `tried` tables ?
+[NOTE]
+===============================
+As seen in PR #5941, Bitcoin Core increased the size of the tables four times as a countermeasure against the Eclipse attack because it increases the botnet cost. +
+
+However, increasing the table sizes actually makes the EREBUS attack much easier, as the EREBUS adversary has much greater bandwidth capacity and significantly more IP addresses.
+
+This is a case of conflicting requirements, where the tradeoff between both has to be well evaluated.
+===============================
+
+[[current_implementation]]
+=== Current Implementation
+
+There are some classes that handle the network connection to other peers: `CNetAddr`, `CService`, `CAddress`, `CAddrInfo` and `CAddrMan`. This is not an exhaustive list, but these are the relevant ones in this context.
+
+[[cnetaddr]]
+==== `CNetAddr`
+
+`CNetAddr` is the network address itself. Two important fields in this class is the `m_addr` and `m_net`. +
+`m_addr` is the raw representation of the network address, in network byte order (big endian) for IPv4 and IPv6.
+`m_net` represents the network to which this address belongs. The networks supported by Bitcoin Core is defined in BIP 155 and in the `Network` enum.
+
+The `CNetAddr::ToStringIP()` method returns a human readable IP address. It also returns `Tor` or `I2P` address, if the peer is connected on these networks.
+
+[source,c++]  
+----
+enum Network
+{
+    NET_UNROUTABLE = 0,
+    NET_IPV4,
+    NET_IPV6,
+    NET_ONION,
+    NET_I2P,
+    NET_CJDNS,
+    NET_INTERNAL,
+    NET_MAX,
+};
+
+class CNetAddr
+{
+    protected:
+        prevector<ADDR_IPV6_SIZE, uint8_t> m_addr{ADDR_IPV6_SIZE, 0x0};
+        Network m_net{NET_IPV6};
+        // ...
+}
+----
+
+[[cservice]]
+==== `CService`
+
+`CService` is the combination of a network address (`CNetAddr`) and a (TCP) port. It inherits all members from `CNetAddr` and adds an `uint16_t port` field.
+
+The `ToStringIPPort()` method is used to return the IP and the port of the peer. This is used to set the `CNode::addrName` and to describe the peer to the user in `getpeerinfo`, `-netinfo` commands and in the Peer Table GUI (`peertablemodel.cpp`).
+
+[source,c++]  
+----
+class CService : public CNetAddr
+{
+    protected:
+        uint16_t port;
+    public:
+        CService();
+        CService(const CNetAddr& ip, uint16_t port);
+        // ...
+        uint16_t GetPort() const;
+        // ...
+        std::string ToStringPort() const;
+        std::string ToStringIPPort() const;
+        // ...   
+}
+----
+
+These two classes `CNetAddr` and `CService` were created in the https://github.com/bitcoin/bitcoin/pull/735[PR #735] to refactor class `CAddress`. 
+
+[[caddress]]
+==== `CAddress`
+
+`CAddress` is a class derived from `CService`. It adds two information about the peer: the `uint32_t nTime` and `ServiceFlags nServices`.
+
+`nTime` represents the last time the peer was seen online. The default value is `TIME_INIT` (100000000). This value is updated every time the address is added to AddrMan (from `ADDR` messages, DNS or fixed seeds).
+
+If the `nTime` of an address in the `ADDR` message less than or equal to `TIME_INIT` or 10 minutes greater than the current time, the `nTime` of this address will be 5 days before the current time. Otherwise, it will be the time informed in `ADDR` message.
+
+If the address is retrieved from fixed seeds, its `nTime` receives a random time between one and two weeks ago. If it is from DNS Seeds, random time is between 3 and 7 days old.
+
+When manually adding or disconnecting a peer, `nTime` receives the current time.
+
+`nServices` represents the services provided by the peer. Typically, the node prefers peers that are able to serve the complete blockchain, blocks and transactions including witness data. The service flags are defined in the `ServiceFlags` enum.
+
+[source,c++]  
+----
+class CAddress : public CService
+{
+    static constexpr uint32_t TIME_INIT{100000000};
+
+public:
+    CAddress() : CService{} {};
+    CAddress(CService ipIn, ServiceFlags nServicesIn) : CService{ipIn}, nServices{nServicesIn} {};
+    //...
+    uint32_t nTime{TIME_INIT};
+
+    ServiceFlags nServices{NODE_NONE};
+};
+----
+
+[[caddrinfo]]
+==== `CAddrInfo`
+
+`CAddrInfo` stores statistics about a `CAddress`, such as the last successful connection, new connection attempts since last successful attempt, reference count in `new` table, if the address is in `tried` or `new` table and so others.
+
+This class is used in AddrMan's `mapInfo` which maps the address ids with their statistics (`CAddrInfo`). The information stored in this class is important for many decisions about address management.
+
+The `GetTriedBucket()`, `GetNewBucket()`, `GetBucketPosition()` and  `IsTerrible()` methods are crucial for the correct functioning of the AddrMan.
+
+This class also has the `CNetAddr source` field, which indicates the first peer that anounced this address.
+
+[source,c++]  
+----
+class CAddrInfo : public CAddress
+{
+    // ...
+private:
+    CNetAddr source;
+    int64_t nLastSuccess{0};
+    int nAttempts{0};
+    int nRefCount{0};
+    bool fInTried{false};
+    friend class CAddrMan;
+public:
+    // ...
+    int GetTriedBucket(const uint256 &nKey, const std::vector<bool> &asmap) const;
+    int GetNewBucket(const uint256 &nKey, const CNetAddr& src, const std::vector<bool> &asmap) const;
+    // ...
+    int GetBucketPosition(const uint256 &nKey, bool fNew, int nBucket) const;
+    bool IsTerrible(int64_t nNow = GetAdjustedTime()) const;
+}
+----
+
+[[caddrman]]
+==== `CAddrMan`
+
+`CAddrMan` is the address manager. It handles adding new address, resolving collisions, moving address between tables, persisting and storing the `new` and `tried` tables and much more.
+
+`CAddrMan` has some field that support the address management logic. 
+
+`nIdCount` is used to generate ids for new incoming addresses. Its inital value is 0 and it is incremented is incremented whenever a new address is added to AddrMan. The address ids are stored in the `new` and `tried` tables.
+
+[source,c++]  
+----
+// src/addrman.cpp
+CAddrInfo* CAddrMan::Create(const CAddress& addr, const CNetAddr& addrSource, int* pnId)
+{
+    int nId = nIdCount++;
+    mapInfo[nId] = CAddrInfo(addr, addrSource);
+    mapAddr[addr] = nId;
+    mapInfo[nId].nRandomPos = vRandom.size();
+    vRandom.push_back(nId);
+    if (pnId)
+        *pnId = nId;
+    return &mapInfo[nId];
+}
+----
+
+The code snippet above shows other important fields. `mapInfo` maps the newly created id and the `CAddrInfo`, which represents the adress with statistical information about it and its source (the peer that announced it). 
+
+As mentioned earlier, the `new` and `tried` tables only store the address ids. Any logic that uses the tables and needs more information about the peers, it retrieves from `mapInfo`, looking for the id. 
+
+`mapAddr` maps the network address (`CNetAddr`) and the id, and allows retrieving the id from a given address. This map  adds new address only in the method shown above and removes them in the `CAddrMan::Delete(int nId)`. 
+
+`mapAddr` is used only in the `CAddrMan::Find(...)` method, which finds a `CAddrInfo` given a `CNetAddr` object. As mentioned before, `CNetAddr` is the raw network address (IP without port) and `CAddrInfo` is the complete representation of the address, with IP, port, services and statistics.
+
+This field is necessary because the inputs AddrMan receives are usually a `CAddress` or `CService` object, since `CAddrInfo` is used only internally in `CAddrMan`.
+
+The other fields seen in the code above are `CAddrInfo::nRandomPos` and `CAddrMan::vRandom`. These two fields are used only in `CAddrMan::SwapRandom` and `CAddrMan::_GetAddr(...)` (which is called in response to `GETADDR` message) and their purpose is to randomize the addresses postion in order to to make it more difficult for an observer to infer the order in which the addresses got known.
+
+Tables are represented by the `vvTried` and `vvNew` fields. Both are two-dimensional array (array) where rows represent the total number of buckets for each table and columns represent the maximum allowed number of entries in each bucket.
+
+As seen in the <<eclipse_c6>>, the more buckets have been added since the original implementation. Currently, the total number of buckets for `new` table is defined by `ADDRMAN_NEW_BUCKET_COUNT` (1024) and for the `tried` by `ADDRMAN_TRIED_BUCKET_COUNT` (256). The maximum allowed number of entries in each bucket for both table is defined by `ADDRMAN_BUCKET_SIZE` (64).
+
+The code below shows these fields and the diagram shows the network classes mentioned so far.
+
+[source,c++]  
+----
+class CAddrMan
+{
+    // ...
+    int nIdCount GUARDED_BY(cs);
+    std::map<int, CAddrInfo> mapInfo GUARDED_BY(cs);
+    std::map<CNetAddr, int> mapAddr GUARDED_BY(cs);
+    std::vector<int> vRandom GUARDED_BY(cs);
+    int nTried GUARDED_BY(cs);
+    int vvTried[ADDRMAN_TRIED_BUCKET_COUNT][ADDRMAN_BUCKET_SIZE] GUARDED_BY(cs);
+    int nNew GUARDED_BY(cs);
+    int vvNew[ADDRMAN_NEW_BUCKET_COUNT][ADDRMAN_BUCKET_SIZE] GUARDED_BY(cs);
+    // ...
+}
+----
+
+.Network Classes
+image::images/chapter_2_1/network_classes.svg[]
+[NetworkClasses, align="center"]
+
+[[adding_new_address]]
+=== Adding New Address
+
+New adresses are added to AddrMan when:
+
+. an address is added manually
+. multiple address are received via `ADDR` or `ADDRv2` messages
+. fixed seeds are loaded
+. multiple address are received from DNS Seeds
+
+`CAddrMan::Add_()` is used to add new addresses. It checks if the `CAddress& addr` already exists using `CAddrMan::Find()`. If so, it will be updated only if the `nTime` is more recent or the address does not exist in `tried` table. If the address does not exist, it will be added to `new` table.
+
+[source,c++]  
+----
+bool CAddrMan::Add_(const CAddress& addr, const CNetAddr& source, int64_t nTimePenalty)
+{
+    //...
+    CAddrInfo* pinfo = Find(addr, &nId);
+    //...
+    if (pinfo) {
+        // ...
+        pinfo->nServices = ServiceFlags(pinfo->nServices | addr.nServices);
+
+        if (!addr.nTime || (pinfo->nTime && addr.nTime <= pinfo->nTime))
+            return false;
+
+        if (pinfo->fInTried)
+            return false;
+        
+        if (pinfo->nRefCount == ADDRMAN_NEW_BUCKETS_PER_ADDRESS)
+            return false;
+
+        int nFactor = 1;
+        for (int n = 0; n < pinfo->nRefCount; n++)
+            nFactor *= 2;
+        if (nFactor > 1 && (insecure_rand.randrange(nFactor) != 0))
+            return false;
+     } else {
+        pinfo = Create(addr, source, &nId);
+        pinfo->nTime = std::max((int64_t)0, (int64_t)pinfo->nTime - nTimePenalty);
+        nNew++;
+        fNew = true;
+    }
+    // ...
+}
+----
+
+The original purpose of `CAddrInfo::nRefCount` was to count how many times the address was inserted in the `new` table. Since commit e6b343d880, each address has deterministically hashed to a single fixed location in the "new" and "tried" tables, so this field is now basically used to know if the address is in the `new` table, when the value is 1 or in the `tried` table when value is 0.
+
+The `CAddrMan::Create()` was already presented above and it basically converts `CAddress& addr` and `CNetAddr& source` to a `CAddrInfo` object.
+
+The next part of `CAddrMan::Add_()` gets the bucket and the position that the address will be inserted. The methods used for this are `CAddrInfo::GetNewBucket()` and  `CAddrInfo::GetBucketPosition()`.
+
+`CAddrInfo::GetTriedBucket()` is straighfoward. It will return the hash of the `CAddrMan::nKey` and the network group of the adress. If the `asmap` function is enabled, this group will be ASN code mapped in the file for that IP. Otherwise, it will be the /16 prefix of the IP.
+
+The `CAddrMan::nKey` has its value set when `CAddrMan` is first started. It is a random value and its purpose is to make the position different for each node, so an attacker cannot exploit this bias. The `nkey` is stored in the `peers.dat` and every time the node starts again, it will receive this same value. 
+
+[source,c++]  
+----
+int CAddrInfo::GetTriedBucket(const uint256& nKey, const std::vector<bool> &asmap) const
+{
+    uint64_t hash1 = (CHashWriter(SER_GETHASH, 0) << nKey << GetKey()).GetCheapHash();
+    uint64_t hash2 = (CHashWriter(SER_GETHASH, 0) << nKey << GetGroup(asmap) << (hash1 % ADDRMAN_TRIED_BUCKETS_PER_GROUP)).GetCheapHash();
+    int tried_bucket = hash2 % ADDRMAN_TRIED_BUCKET_COUNT;
+    // ...
+    return tried_bucket;
+}
+----
+
+`CAddrInfo::GetNewBucket()` is very similar to `CAddrInfo::GetTriedBucket()`. +
+`CAddrInfo::GetBucketPosition()` gets the position using the `CAddrMan::nKey` and the bucket. Note that all these methods use the % operator to ensure the hash will be less than or equal to the maximum values allowed (`ADDRMAN_TRIED_BUCKETS_PER_GROUP`, `ADDRMAN_BUCKET_SIZE`, etc ...).
+
+[source,c++]  
+----
+int CAddrInfo::GetBucketPosition(const uint256 &nKey, bool fNew, int nBucket) const
+{
+    uint64_t hash1 = (CHashWriter(SER_GETHASH, 0) << nKey << (fNew ? 'N' : 'K') << nBucket << GetKey()).GetCheapHash();
+    return hash1 % ADDRMAN_BUCKET_SIZE;
+}
+----
+
+If the address position collides with an entry already populated, the method `CAddrInfo::IsTerrible()` is used to decide if the old address will be evicted or not.
+
+[source,c++]  
+----
+bool CAddrInfo::IsTerrible(int64_t nNow) const
+{
+    if (nLastTry && nLastTry >= nNow - 60)
+        return false;
+
+    if (nTime > nNow + 10 * 60)
+        return true;
+
+    if (nTime == 0 || nNow - nTime > ADDRMAN_HORIZON_DAYS * 24 * 60 * 60)
+        return true;
+
+    if (nLastSuccess == 0 && nAttempts >= ADDRMAN_RETRIES)
+        return true;
+
+    if (nNow - nLastSuccess > ADDRMAN_MIN_FAIL_DAYS * 24 * 60 * 60 && nAttempts >= ADDRMAN_MAX_FAILURES)
+        return true;
+
+    return false;
+}
+----
+
+The criteria are:
+
+. If the peer successfully connected less than 1 minute ago, it will be kept.
+
+. If the address time (`nTime`) is set to a future value, this make no sense and will be evicted.
+
+. If the address time (`nTime`) is older than a month (`ADDRMAN_HORIZON_DAYS`).
+
+. If connection to the address was attempted three times or more without any success, it will be evicted.
+
+. If the connection to the address failed 10 times or more in the last week, it will be evicted.
+
+In case of collision, the new address will only be inserted if the old one is evicted.
+The remaing part of `CAddrMan::Add_()` code is shown below:
+
+[source,c++]  
+----
+bool CAddrMan::Add_(const CAddress& addr, const CNetAddr& source, int64_t nTimePenalty)
+{
+    //...
+    int nUBucket = pinfo->GetNewBucket(nKey, source, m_asmap);
+    int nUBucketPos = pinfo->GetBucketPosition(nKey, true, nUBucket);
+    if (vvNew[nUBucket][nUBucketPos] != nId) {
+        bool fInsert = vvNew[nUBucket][nUBucketPos] == -1;
+        if (!fInsert) {
+            CAddrInfo& infoExisting = mapInfo[vvNew[nUBucket][nUBucketPos]];
+            if (infoExisting.IsTerrible() || (infoExisting.nRefCount > 1 && pinfo->nRefCount == 0)) {
+                // Overwrite the existing new table entry.
+                fInsert = true;
+            }
+        }
+        if (fInsert) {
+            ClearNew(nUBucket, nUBucketPos);
+            pinfo->nRefCount++;
+            vvNew[nUBucket][nUBucketPos] = nId;
+        } else {
+            if (pinfo->nRefCount == 0) {
+                Delete(nId);
+            }
+        }
+    }
+    return fNew;
+}
+----
+
+[[connecting_to_an_address]]
+=== Connecting to an Address
+
+`CAddrMan ::Select_ (bool newOnly)` returns a random address that exists in the `tried` or `new` table. If the parameter `newOnly` is true, the address will be taken only from the table `new`. This method is called in `CConnman ::ThreadOpenConnections`, when the node looks for new addresses to connect to and test.
+
+[source,c++]  
+----
+void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
+{
+    // ...
+    CAddrInfo addr;
+    // ...
+    addrman.ResolveCollisions();
+    // ...
+    if (fFeeler) {
+        addr = addrman.SelectTriedCollision();
+
+        if (!addr.IsValid()) {
+            addr = addrman.Select(true);
+        } else if (AlreadyConnectedToAddress(addr)) {
+            addrman.Good(addr);
+            addr = addrman.Select(true);
+        }
+    } else {
+        addr = addrman.Select();
+    }
+    // ...
+}
+----
+
+For outbound connection, the node calls `addrman.Select()` to retrieve a random address to connect to. +
+`CAddrMan::Select_(bool newOnly)` is relatively simple. It has 50% chance for choosing between tried and new table entries and randomly selects one of them. If the entry value is -1, it has no address allocated, so it continues looping until the address is different from -1.
+
+But there is one more step before returning the selected address. It calls `CAddrInfo::GetChance()` to lower the priority of very recent attempts away and after each failed attempt. After the 8th attempt, it start starts to avoid this address.
+
+If the address does not pass `CAddrInfo ::GetChance()`, the method returns to the beginning of the loop and randomly selects a new address.
+
+[source,c++]  
+----
+CAddrInfo CAddrMan::Select_(bool newOnly)
+{
+    // ...
+    if (!newOnly &&
+       (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0))) {
+        double fChanceFactor = 1.0;
+        while (1) {
+            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);
+            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);
+            while (vvTried[nKBucket][nKBucketPos] == -1) {
+                nKBucket = (nKBucket + insecure_rand.randbits(ADDRMAN_TRIED_BUCKET_COUNT_LOG2)) % ADDRMAN_TRIED_BUCKET_COUNT;
+                nKBucketPos = (nKBucketPos + insecure_rand.randbits(ADDRMAN_BUCKET_SIZE_LOG2)) % ADDRMAN_BUCKET_SIZE;
+            }
+            int nId = vvTried[nKBucket][nKBucketPos];
+            assert(mapInfo.count(nId) == 1);
+            CAddrInfo& info = mapInfo[nId];
+            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30))
+                return info;
+            fChanceFactor *= 1.2;
+        }
+    }
+    // ...
+}
+----
+[[test-vefore-evict]]
+=== Test-Before-Evict
+
+In the `CConnman ::ThreadOpenConnections` code shown above,it can be seen that there is another logic for feeler connections (`if (fFeeler)`).
+
+When the node receives the `VERSION` message from the peer, it considers the connection is successfully and calls `m_addrman.Good()` to update some fields (`CAddrInfo::nLastSuccess`, `CAddrInfo::nLastTry` and `CAddrInfo::nAttempts`) and to move the address to the `tried` table.
+
+However, if this address maps to an entry in `tried` table that is already populated, it will be inserted in another table called `m_tried_collisions` and the `tried` table will remain with the old address for a while.
+
+[source,c++]  
+----
+void CAddrMan::Good_(const CService& addr, bool test_before_evict, int64_t nTime)
+{
+    // ...
+    CAddrInfo* pinfo = Find(addr, &nId);
+    // ...
+    info.nLastSuccess = nTime;
+    info.nLastTry = nTime;
+    info.nAttempts = 0;
+    // ...
+    int tried_bucket = info.GetTriedBucket(nKey, m_asmap);
+    int tried_bucket_pos = info.GetBucketPosition(nKey, false, tried_bucket);
+
+    if (test_before_evict && (vvTried[tried_bucket][tried_bucket_pos] != -1)) {
+        // ...
+        if (m_tried_collisions.size() < ADDRMAN_SET_TRIED_COLLISION_SIZE) {
+            m_tried_collisions.insert(nId);
+        }
+    } else {
+        LogPrint(BCLog::ADDRMAN, "Moving %s to tried\n", addr.ToString());
+        MakeTried(info, nId);
+    }
+}
+----
+
+This table was created to implement the <<eclipse_c3>>. It holds addresses inserted into tried table that collide with existing entries. https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.cpp#L253[No more than ten addresses] can be in the test buffer at once (defined in https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/addrman.h[ADDRMAN_SET_TRIED_COLLISION_SIZE] constant) and since feeler connections are used to test the collision addresses, it is necessary https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[to wait at least two minutes] to test the next. This rate limits an attacker attempting to launch an eclipse attack.
+
+The method `CAddrMan::SelectTriedCollision_()` selects a random element from m_tried_collisions and gets the equivalent address in the `tried` table (the one in the same bucket and position). The method returns the id of this address (called `id_old`) to be tested. 
+
+[source,c++]  
+----
+CAddrInfo CAddrMan::SelectTriedCollision_()
+{
+    // ...
+
+    const CAddrInfo& newInfo = mapInfo[id_new];
+
+    // which tried bucket to move the entry to
+    int tried_bucket = newInfo.GetTriedBucket(nKey, m_asmap);
+    int tried_bucket_pos = newInfo.GetBucketPosition(nKey, false, tried_bucket);
+
+    int id_old = vvTried[tried_bucket][tried_bucket_pos];
+
+    return mapInfo[id_old];
+}
+----
+
+`CAddrMan::ResolveCollisions_()` checks whether any to-be-evicted tried table entries have been tested and if so resolve the collision. The criteria are:
+
+. If the new address is not found in `mapInfo`, it is removed from `m_tried_collisions`.
+
+. If the position in the `tried` bucket is empty, the new address will be inserted there.
+
+. If the new address no longer maps to a valid address, it is removed from `m_tried_collisions`.
+
+. If the old address has successfully connected in last 4 hours, it will be kept and the new one will be removed from `m_tried_collisions`.
+
+. If the old address has attempted to connect and has failed in last 4 hours, give the address at least 60 seconds to successfully connect. If it fails, the new address will replace the existing address in the `tried` table.
+
+. If the collision hasn't been resolved in 40 minutes, the old entry will be evicted anyway.
+
+Every https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[2 minutes], if there is no conflicting address, `addrman.Select(true)` is called to initiate a feller connection to an address stored in the `new` table. This implements the <<eclipse_c4>>.
+
+[[responding_getaddr_messages]]
+=== Responding to `GETADDR` Messages
+
+The `GETADDR` message requests an `ADDR` or `ADDRv2` message from the receiving node.
+The node responds to this message by calling `CAddrMan::GetAddr_()` to build the `vector<CAddress>` to be sent to the requesting peer.
+
+Before that, however, if the peer does not have `addr` permission, the addresses will be retrieved from a cache that stores the responses to GETADDR daily, so that an attacker gets the same 1,000 records per day (at most) and cannot track changes over real time. This was implemented in the https://github.com/bitcoin/bitcoin/pull/18991[PR #18991].
+
+`CAddrMan::GetAddr_()` is straighfoward. It randomly swaps the order of stored `CAddrInfo` objcts, therefore an observer cannot infer the order in which the addresses were known. The swap is done by `CAddrMan::SwapRandom()`.
+
+Next, it checks if the address is terrible (`CAddrInfo::IsTerrible`). All the criteria that make an address terrrible were mentioned in <<adding_new_address>> section.
+
+[source,c++]  
+----
+void CAddrMan::GetAddr_(std::vector<CAddress>& vAddr, size_t max_addresses, size_t max_pct)
+{
+    size_t nNodes = vRandom.size();
+    // ....
+    for (unsigned int n = 0; n < vRandom.size(); n++) {
+        if (vAddr.size() >= nNodes)
+            break;
+
+        int nRndPos = insecure_rand.randrange(vRandom.size() - n) + n;
+        SwapRandom(n, nRndPos);
+        assert(mapInfo.count(vRandom[n]) == 1);
+
+        const CAddrInfo& ai = mapInfo[vRandom[n]];
+        if (!ai.IsTerrible())
+            vAddr.push_back(ai);
+    }
+}
+----
+
+[[summary]]
+=== Summary
+
+Bitcoin Core tracks and stores addresses using a component known as address manager or AddrMan, implemented in the class `CAddrMan`.
+
+AddrMan has changed several times since its original implementation as result of the countermeasures suggested by _Eclipse Attack_ and _Erebus Attack_ papers and due to some other minor PRs to increase the privacy and prevent topology leaks.
+
+The main fields of Addrman are the `new` and `tried` tables and the `mapInfo`. The `new` table stores addresses for peers to whom the node has not yet initiated a connection.  The `tried` table table stores the addresses for peers to whom the node has successfully established connection. And `mapInfo` stores the id and other informations of all addresses that AddrMan has seen.
+
+The main processes that call AddrMan are: adding a new addresses from a `ADDR` message, selecting an address to connect to, testing an entry in `tried` table before evicting it or testing random address in `new` table to move it to `tried` and responding a `GETADDR` message.
+
+
+[[references]]
+=== References
+
+* https://erebus-attack.comp.nus.edu.sg/[A Stealthier Partitioning Attack against Bitcoin Peer-to-Peer Network]
+
+* https://github.com/bitcoin-core/bitcoin-devwiki/wiki/Addrman-and-eclipse-attacks[Addrman and eclipse attacks]
+
+* https://core.ac.uk/download/pdf/288502346.pdf[Characterization of the topology of theBitcoin network]
+
+* https://cs-people.bu.edu/heilman/eclipse[Eclipse Attacks on Bitcoin’s Peer-to-Peer Network]
+
+* https://developer.bitcoin.org/reference/p2p_networking.html[P2P Network]

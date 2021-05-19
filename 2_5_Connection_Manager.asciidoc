@@ -1,0 +1,705 @@
+[[addrman]]
+== ConnMan
+
+`CConnman` class was created in the https://github.com/bitcoin/bitcoin/pull/8085[PR #8085] to to encapsulate P2P connections. Today, this class manages the network layer logic.
+
+It creates sockets for listening for incoming connections and binds them to addresses and ports. It loads the `peer.dat` file to connect to addresses previously seen or already connected to. It also loads the `anchors.dat` to establish block-only connections. It starts the network threads. It handles the interruption of the network and the node shutdown.
+
+This text describes the Network Layer and and how Connman works.
+
+The commit https://github.com/bitcoin/bitcoin/commit/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[c7dd9ff71b] can be used as a reference for the https://github.com/bitcoin/bitcoin/tree/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[project's codebase] at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch c7dd9ff71b
+
+[[starting_the_node]]                           
+=== Starting The Node
+
+The `CConnman` and all the network processes are started in `AppInitMain(...)`, which is basically the main function of the application. When the node shuts down, connections are securely closed by `CConnman`.
+
+[source,c++]  
+----
+bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
+{
+    // ...
+    assert(!node.connman);
+    node.connman = std::make_unique<CConnman>(GetRand(std::numeric_limits<uint64_t>::max()), GetRand(std::numeric_limits<uint64_t>::max()), *node.addrman, args.GetBoolArg("-networkactive", true));
+    // ...
+    if (!node.connman->Start(*node.scheduler, connOptions)) {
+        return false;
+    }
+    // ...
+}
+
+void Interrupt(NodeContext& node)
+{
+    // ...
+    if (node.connman)
+        node.connman->Interrupt();
+    // ...
+}
+
+void Shutdown(NodeContext& node)
+{
+    // ...
+    if (node.connman) node.connman->Stop();
+    // ...
+    node.connman.reset();
+    // ...
+}
+----
+
+The `node` variable refers to the `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h#L39[struct NodeContext]`. It is a struct that contains references to chain state and connection state. This is used by the init function, RPC, GUI and test code to pass object references around without needing to declare the same variables and parameters repeatedly, or to use globals. The struct is defined in `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h[src/node/context.h]`.
+
+Before this struct was created, the global variable `g_conman` was used to manage the connection. But using global variables reduces the modularity and flexibility of the program, so the https://github.com/bitcoin/bitcoin/pull/16839[PR #16839] has gotten rid of the some global variables and has made `g_conman` a NodeContext member (now called `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h#L43[connman]`).
+
+[[starting_connections]]
+=== Starting Connections
+
+`CConnman::Start()` initiates all the network process and keeps them running. The first step is creating sockets for listening for incoming connections. By default, the sockets will be binded to 0.0.0.0:8333 (IPv4), [::]:8333 (IPv6) and 127.0.0.1:8334 (as a proxy for onion network). However, the user can define an different address passing it through the `-bind` or `-whitebind` argument when stating the node. This is done by `CConnman::InitBinds()`.
+
+.Difference between `-bind` and `-whitebind`
+[NOTE]
+===============================
+`-whitebind` option which works like `-bind`, except peers connecting to it are whitelisted (allowing a separate listen port for trusted connections). It was implemented in the https://github.com/bitcoin/bitcoin/pull/4378[PR #4378].
+===============================
+
+// Bind code
+[source,c++]  
+----
+bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
+{
+    Init(connOptions);
+
+    if (fListen && !InitBinds(connOptions.vBinds, connOptions.vWhiteBinds, connOptions.onion_binds)) {
+        if (clientInterface) {
+            clientInterface->ThreadSafeMessageBox(
+                _("Failed to listen on any port. Use -listen=0 if you want this."),
+                "", CClientUIInterface::MSG_ERROR);
+        }
+        return false;
+    }
+    // ...
+}
+----
+
+[source,c++]  
+----
+bool CConnman::InitBinds(...)
+{
+    // ...
+    for (const auto& addrBind : binds) {
+        fBound |= Bind(addrBind, (BF_EXPLICIT | BF_REPORT_ERROR), NetPermissionFlags::None);
+    }
+    for (const auto& addrBind : whiteBinds) {
+        fBound |= Bind(addrBind.m_service, (BF_EXPLICIT | BF_REPORT_ERROR), addrBind.m_flags);
+    }
+    if (binds.empty() && whiteBinds.empty()) {
+        struct in_addr inaddr_any;
+        inaddr_any.s_addr = htonl(INADDR_ANY);
+        struct in6_addr inaddr6_any = IN6ADDR_ANY_INIT;
+        fBound |= Bind(CService(inaddr6_any, GetListenPort()), BF_NONE, NetPermissionFlags::None);
+        fBound |= Bind(CService(inaddr_any, GetListenPort()), !fBound ? BF_REPORT_ERROR : BF_NONE, NetPermissionFlags::None);
+    }
+    // ...
+}
+----
+
+Next, if the user also has specified `-seednode`, an `ADDR_FETCH` connection is created for each seed to retrieve the addresses. +
+`CConnman::AddAddrFetch()` adds the seed to `m_addr_fetches` vector. The method `CConnman::ProcessAddrFetch()` gets the first address of the vector and create the `ADDR_FETCH` connection using `CConnman::OpenNetworkConnection(...)`.
+
+`CConnman::ProcessAddrFetch()` is called uninterruptedly in the `CConnman::ThreadOpenConnections()` thread. The method only stops working when `interruptNet` is triggered, which happens when the node is shut down.
+
+`ProcessAddrFetch()` is also once called if the node is started with `connect=<ip>`. The reason is that seeds can also be inserted in  `m_addr_fetches` in `CConnman::ThreadDNSAddressSeed()` if the node is behind a proxy or if the seeder does not support service bit filtering over DNS.
+
+Then, the `CConnman` loads addresses from `peers.dat`. This is done by by `CAddrDB::Read(CAddrMan& addr)`, which deserializes the contents of the file and allocates them to `CAddrMan& addr`. The sole purpose of `CAddrDB` is to write and read the (IP) address database (`peers.dat`).
+
+[source,c++]  
+----
+// src/net.cpp
+bool CConnman::Start(...)
+{
+    // ...
+    CAddrDB adb;
+    if (adb.Read(addrman))
+        LogPrintf("Loaded %i addresses from peers.dat  %dms\n", addrman.size(), GetTimeMillis() - nStart);
+    else {
+        addrman.Clear(); // Addrman can be in an inconsistent state after failure, reset it
+        LogPrintf("Recreating peers.dat\n");
+        DumpAddresses();
+    }
+    // ...
+}
+
+// src/addrdb.cpp
+CAddrDB::CAddrDB()
+{
+    pathAddr = gArgs.GetDataDirNet() / "peers.dat";
+}
+
+bool CAddrDB::Write(const CAddrMan& addr)
+{
+    return SerializeFileDB("peers", pathAddr, addr);
+}
+
+bool CAddrDB::Read(CAddrMan& addr)
+{
+    return DeserializeFileDB(pathAddr, addr);
+}
+----
+
+Note that `CConnman::addrman` is a reference to `NodeContext::addrman`. Both are the same object. There is only one `CConnman` and one`CAddrman` in the entire application, defined in `NodeContext`.
+
+The next step is loading addresses from `anchors.dat`, which stores the addresses of block-relay connections that have already been made. This is done by `ReadAnchors()` 
+
+`CConnman::m_use_addrman_outgoing` indicates whether the node wants to initiate outbound connections. It will be false only if `-connect` argument is set when starting the node.
+
+[source,c++]  
+----
+// src/net.cpp
+bool CConnman::Start(...)
+{
+    // ...
+    if (m_use_addrman_outgoing) {
+        // Load addresses from anchors.dat
+        m_anchors = ReadAnchors(gArgs.GetDataDirNet() / ANCHORS_DATABASE_FILENAME);
+        if (m_anchors.size() > MAX_BLOCK_RELAY_ONLY_ANCHORS) {
+            m_anchors.resize(MAX_BLOCK_RELAY_ONLY_ANCHORS);
+        }
+        LogPrintf("%i block-relay-only anchors will be tried for connections.\n", m_anchors.size());
+    }
+    // ...
+}
+----
+
+Then, semaphores are initialized for limiting connections. `semOutbound` is used to control outgoing connections and `semAddnode` to manual connections. `CSemaphore` constructor takes a counter as parameter, which is the maximum number of connections allowed. The counter is initialized in the constructor. Acquiring the semaphore decreases the counter, and releasing the semaphore increases the counter. This was implemented in the https://github.com/bitcoin/bitcoin/pull/1260[PR #1260].
+
+// max conn
+
+There are three flags to control the network activities:
+
+. `InterruptSocks5` interrupts reading bytes from a proxy. The user can specify a proxy for all outgoing network traffic with `-proxy` argument.
+
+. `interruptNet` signals when network activity should cease. This object is an instance of `CThreadInterrupt`, a helper class for interruptible sleeps. It overloads the () operator, which sets the `flag` field is set to true. In various network threads, there is an infinite loop controlled by this variable. When its value is true, the thread stops. `CThreadInterrupt::reset()` sets it to false again.
+
+. `flagInterruptMsgProc` is a boolean field and it is set to `true` when the node is interrupted. It is only used in `CConnman::ThreadMessageHandler` thread to stop receiving new messages.
+
+These flags were implemented in the https://github.com/bitcoin/bitcoin/pull/9289[PR #9289]. The objective was to allow asynchronous network handling. It was necessary to have more control over the shutdown process in order to deal with asynchronous connecting and sending/receiving data.
+
+There are 3 flags (and not just one) because the things need to be done in sequence. Message processing needs to be terminated before forcing all networking down, otherwise there is the risk of trying to process a node's messages during its destruction. This behavior can be seen in  `CConnman::Interrupt()`.
+
+[source,c++]  
+----
+void CConnman::Interrupt()
+{
+    {
+        LOCK(mutexMsgProc);
+        flagInterruptMsgProc = true;
+    }
+    condMsgProc.notify_all();
+
+    interruptNet();
+    InterruptSocks5(true);
+
+    if (semOutbound) {
+        for (int i=0; i<m_max_outbound; i++) {
+            semOutbound->post();
+        }
+    }
+
+    if (semAddnode) {
+        for (int i=0; i<nMaxAddnode; i++) {
+            semAddnode->post();
+        }
+    }
+}
+----
+
+With the semaphores and flags defined, the next step is to  sequentially start all the network threads.
+
+[[thread_socket_handler]]
+=== `ThreadSocketHandler`
+
+The first thread started is the `ThreadSocketHandler`. The thread's main code is a loop that runs three functions continuously until interrupted by `interruptNet` flag.
+
+[source,c++]  
+----
+void CConnman::ThreadSocketHandler()
+{
+    while (!interruptNet)
+    {
+        DisconnectNodes();
+        NotifyNumConnectionsChanged();
+        SocketHandler();
+    }
+}
+----
+
+`CConnman::DisconnectNodes()` first checks if the network is active via the `fNetworkActive` property, which is `true` by default and can be changed by the RPC command `setnetworkactive`, which disables/enables all P2P network activity. If enabled, all connected nodes will have the `CNode::fDisconnect` field changed to true.
+
+`CNode::fDisconnect` is particularly important field. It is used in various parts of the application to disconnect any node that does not comply with the consensus rules.
+
+[source,c++]  
+----
+void CConnman::DisconnectNodes()
+{
+    {
+        LOCK(cs_vNodes);
+
+        if (!fNetworkActive) {
+            // Disconnect any connected nodes
+            for (CNode* pnode : vNodes) {
+                if (!pnode->fDisconnect) {
+                    LogPrint(BCLog::NET, "Network not active, dropping peer=%d\n", pnode->GetId());
+                    pnode->fDisconnect = true;
+                }
+            }
+        }
+        // ...
+    }
+}
+----
+
+Note that before accessing `vNode`, there is a `LOCK(cs_vNodes)`. +
+`std::vector<CNode*> vNodes` is the vector that stores all connected nodes. Its access is protected by the recursive mutex `Note`. +
+The recursive_mutex class is a synchronization primitive that can be used to protect shared data from being simultaneously accessed by multiple threads.
+`LOCK(cs_vNodes)` locks the mutex. If another thread has already locked the mutex, a call to lock will block execution until the lock is acquired.
+
+Then the peers with `fDisconnect` field set to true will be disconnected. To do it, there are a few steps: The peer is removed from `vNodes` list, , it releases the outbound semaphore grant, closes the socket and the peer is kept in the disconnected pool (`std::list<CNode*> vNodesDisconnected`) until all references to it (`CNode::nRefCount`) are released.
+
+`CNode::CloseSocketDisconnect()` checks that `CNode::hSocket` is different from `INVALID_SOCKET` and if so, calls `close()` function of POSIX operating system API to close the socket.
+
+`INVALID_SOCKET` is defined as `(SOCKET)(~0)` in `src/compat.h`. It is the same way `WinSock2.h` defines this constant. The reason is that Bitcoin Core originally used `WinSock2.h` to manage socket, but in the commit https://github.com/bitcoin/bitcoin/commit/e874738d3de335faacb83d0398cabdff7477bfa0[e874738], this definition has been added so that the application no longer depends on Windows headers.
+
+`SOCKET` is just an alias for `unsigned int`, so `(SOCKET)(~0)` has the value `4294967295` (a.k.a. `UINT_MAX`). +
+`4294967295` and `-1` have the same binary representation of `0xFFFFFFFF` or 32 bits all set to `1`. +
+The POSIX function used to create socket is `accept()`. And, upon successful completion, it returns non-negative file descriptor (an integer) of the accepted socket. Otherwise, `-1`. +
+Therefore, the `(SOCKET) (~0)` has the same binary value that indicates an error in creating the socket.
+
+.POSIX (Portable Operating System Interface) 
+[NOTE]
+===============================
+POSIX (Portable Operating System Interface) is a set of standard operating system interfaces based on the Unix operating system. 
+The idea is that a program written to be based on POSIX standards can be easily ported across a large family of Unix derivatives (including, but not limited to, Linux and OSX).
+===============================
+
+[source,c++]  
+----
+void CConnman::DisconnectNodes()
+{
+    {
+        LOCK(cs_vNodes);
+        // ...
+        std::vector<CNode*> vNodesCopy = vNodes;
+        for (CNode* pnode : vNodesCopy)
+        {
+            if (pnode->fDisconnect)
+            {
+                // remove from vNodes
+                vNodes.erase(remove(vNodes.begin(), vNodes.end(), pnode), vNodes.end());
+
+                // release outbound grant (if any)
+                pnode->grantOutbound.Release();
+
+                // close socket and cleanup
+                pnode->CloseSocketDisconnect();
+
+                // hold in disconnected pool until all refs are released
+                pnode->Release();
+                vNodesDisconnected.push_back(pnode);
+            }
+        }
+    }
+    // ...
+}
+----
+
+There is a mechanism for assessing whether a CNode is still in use: the `CNode::nRefCount`. This field is incremented via `CNode::AddRef()` when the peer is created, during socket service and message handling. And `CNode::Release()` decreases it. When there are no more references to this `CNode`, it can be safely disconnected.
+
+When `CNode::nRefCount` is 0, the node can be deleted and removed from the disconnected pool `vNodesDisconnected`.
+
+[source,c++]  
+----
+void CConnman::DeleteNode(CNode* pnode)
+{
+    assert(pnode);
+    m_msgproc->FinalizeNode(*pnode);
+    delete pnode;
+}
+// ...
+void CConnman::DisconnectNodes()
+{
+    // ...
+    {
+        // ...
+        std::list<CNode*> vNodesDisconnectedCopy = vNodesDisconnected;
+        for (CNode* pnode : vNodesDisconnectedCopy)
+        {
+            if (pnode->GetRefCount() <= 0) {
+                vNodesDisconnected.remove(pnode);
+                DeleteNode(pnode);
+            }
+        }
+    }
+}
+----
+
+To delete the node, the message `m_msgproc->FinalizeNode(\*pnode)` is sent to `net_processing.{h,cpp}` region.  +
+The interface `NetEventsInterface* m_msgproc` is implemented by `PeerManager` (which is the base class for `PeerManagerImpl`). +
+`PeerManagerImpl::FinalizeNode(const CNode& node)` permanently removes the peer from memory and eventually saves it to the disk if it is from an outbound connection and its misbehavior score is zero. +
+This method also removes the peer from `PeerManagerImpl::m_peer_map`, that is a map of all `Peer` objects. It also eliminates any blocks to be downloaded from this peer, stops processing announcements from it and cleans the `CNodeState::fPreferredDownload` and `CNodeState::ChainSyncTimeoutState::m_protect` status from this peer.
+
+[source,c++]  
+----
+void PeerManagerImpl::FinalizeNode(const CNode& node)
+{
+    NodeId nodeid = node.GetId();
+    int misbehavior{0};
+    {
+    LOCK(cs_main);
+    {
+        PeerRef peer = RemovePeer(nodeid);
+        assert(peer != nullptr);
+        misbehavior = WITH_LOCK(peer->m_misbehavior_mutex, return peer->m_misbehavior_score);
+    }
+    CNodeState *state = State(nodeid);
+    // ...
+    m_txrequest.DisconnectedPeer(nodeid);
+    nPreferredDownload -= state->fPreferredDownload;
+    nPeersWithValidatedDownloads -= (state->nBlocksInFlightValidHeaders != 0);
+    assert(nPeersWithValidatedDownloads >= 0);
+    m_outbound_peers_with_protect_from_disconnect -= state->m_chain_sync.m_protect;
+    // ...
+    if (node.fSuccessfullyConnected && misbehavior == 0 &&
+        !node.IsBlockOnlyConn() && !node.IsInboundConn()) {
+        m_addrman.Connected(node.addr);
+    }
+}
+----
+
+`CConnman::NotifyNumConnectionsChanged()` simply keeps track of the number of connections and notifies the client interface (`CClientUIInterface`) when it changes. +
+The node does not access the GUI directly. It sends the message `CClientUIInterface::NotifyNumConnectionsChanged()` to the interface, so it can signal that the number of connection has changed. Both `CConnman` and `CClientUIInterface` are in thread "_net_" (`ThreadSocketHandler`) .
+
+`client.cpp::NotifyNumConnectionsChanged()` intercepts the signal and calls the `ClientModel::updateNumConnections()` method, that is in "bitcoin-qt" thread (the main GUI).
+
+[source,c++]  
+----
+// src/node/ui_interface.cpp
+void CClientUIInterface::NotifyNumConnectionsChanged(int newNumConnections) { return g_ui_signals.NotifyNumConnectionsChanged(newNumConnections); }
+
+// src/node/ui_interface.cpp
+static void NotifyNumConnectionsChanged(ClientModel *clientmodel, int newNumConnections)
+{
+    bool invoked = QMetaObject::invokeMethod(clientmodel, "updateNumConnections", Qt::QueuedConnection, Q_ARG(int, newNumConnections));
+    assert(invoked);
+}
+
+void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndHeaderTipInfo* tip_info)
+{
+    this->clientModel = _clientModel;
+    if(_clientModel)
+    {
+        //...
+        connect(_clientModel, &ClientModel::numConnectionsChanged, this, &BitcoinGUI::setNumConnections);
+        // ...
+    }
+}
+----
+
+`CConnman::SocketHandler()` encapsulates some important socket functions.
+
+When Bitcoin Core is started, `CConnman::BindListenPort()` and `src/netbase.cpp:CreateSockTCP(...)` create some sockets to listen incoming connection. To do this, the functions use POSIX functions `socket()`, `setsockopt()`, `bind()` and them `listen()` to configure the socket.
+
+A detailed explanation of each of these POSIX functions can be found in link:2_4_Socket_Programming.asciidoc[Socket Programming] text.
+
+The sockets to listen for connections are stored in the `std::vector<ListenSocket> CConnman::vhListenSocket` field. The first function that `CConnman::SocketHandler()` calls is `CConnman::AcceptConnection(...)` for each listening socket. This method accepts the incoming connection via POSIX function `accept()`. 
+
+If the node operator does not want to accept incoming connection, the argument `-listen=0` can be used.
+
+The `CConnman::CreateNodeFromAcceptedSocket()` creates a `CNode` object with the socket and allocates it in `std::vector<CNode*> CConnman::vNodes`, which maintains a list of connected nodes.
+
+Another important function is `CConnman::SocketEvents(...)`. This function retrieves the peers (sockets) that will be monitored. To do this, the POSIX function `select()` or `poll()` is used. They allow a large number of sockets to be monitored, all in one shot without having to block individually for each socket.
+
+The difference between `select()` or `poll()` is the number of sockets allowed and the efficiency. This is also better explained in the link:2_4_Socket_Programming.asciidoc[Socket Programming] text.
+
+If there are nodes to receive information from (`recv_set`), the POSIX command `recv()` is used on each node/socket. The received message is allocated in `vRecvMsg`, and then in `CNode::vProcessMsg` to be processed in `PeerManagerImpl::ProcessMessages(...)`.
+
+`CConnman::SocketSendData(CNode& node)` send data to the the peers. This function uses POSIX function `send()`. The message to send are stored in `CNode::vSendMsg` vector and they are inserted in this vector in `CConnman::PushMessage(...)`. Once sent, the message is removed from the vector.
+
+[source,c++]  
+----
+void CConnman::SocketHandler()
+{
+    std::set<SOCKET> recv_set, send_set, error_set;
+    SocketEvents(recv_set, send_set, error_set);
+
+    if (interruptNet) return;
+
+    for (const ListenSocket& hListenSocket : vhListenSocket)
+    {
+        if (hListenSocket.socket != INVALID_SOCKET && recv_set.count(hListenSocket.socket) > 0)
+        {
+            AcceptConnection(hListenSocket);
+        }
+    }
+    // ...
+    for (CNode* pnode : vNodesCopy)
+    {
+        // ...
+        {
+            // ...
+            nBytes = recv(pnode->hSocket, (char*)pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
+        }
+        // ...
+        if (sendSet) {
+            // Send data
+            size_t bytes_sent = WITH_LOCK(pnode->cs_vSend, return SocketSendData(*pnode));
+            if (bytes_sent) RecordBytesSent(bytes_sent);
+        }
+        // ...
+    }
+    // ...
+}
+----
+[[thread_dns_address_seed]]
+=== `ThreadDNSAddressSeed`
+
+The `ThreadDNSAddressSeed` is used to connect to DNS Servers and to retrieve  a list of IP addresses that have recently been running a Bitcoin client. 
+
+Typically, this thread is used when the node is started for the first time. Otherwise, the node avoids the DNS Seeds, since these connections leaks to the ISP that the requestor is a running bitcoin node. Also, DNS sources can provide useless or malicious addresses. 
+
+The thread first retrieves the DNS seeds, that are hardcoded and stored in `src/chainparams.cpp` and randomizes their order.
+
+Then, it checks if the user wants to force the use of the DND Seeds which can be done with `-forcednsseed`. It also checks if the address manager (CConnman::addrman) already has addresses.
+
+If there are peers stored in `addrman`, then the `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1588[ThreadDNSAddressSeed]` waits for a while before querying DNS seeds. The waiting time is defined by the constant `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L72[DNSSEEDS_DELAY_MANY_PEERS]` (5 minutes) if there are 1000 peers or more stored. Otherwise, it is defined by the constant `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L71[DNSSEEDS_DELAY_FEW_PEERS]` (11 seconds).
+
+`ThreadDNSAddressSeed` checks whether the node was able to connect successfully to at least 2 peers loaded from the AddrMan (Addresses Manager). In this case, it skips querying DNS and the thread execution finishes. These connections can be either full relay or block relay.
+
+If the node does not get any connections, it will https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1678[query these seeds via the DNS protocol], which resolves to IP addresses independent from the bitcoin protocol. But if the node is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1666[behind a proxy] (or if the seeder https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1690[does not support] service bit filtering over DNS), the seeders are treated as an `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L182[ADDR_FETCH]` connection.
+
+To prevent a single malicious seeder from dominating AddrMan by announcing large numbers of IP addresses, the number of IPs each seeder can contribute is https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1677[limited to 256].
+
+[source,c++]  
+----
+void CConnman::ThreadDNSAddressSeed()
+{
+    FastRandomContext rng;
+    std::vector<std::string> seeds = Params().DNSSeeds();
+    Shuffle(seeds.begin(), seeds.end(), rng);
+    // ...
+    if (gArgs.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED)) {
+        seeds_right_now = seeds.size();
+    } else if (addrman.size() == 0) {
+        seeds_right_now = seeds.size();
+    }
+    // ...
+    const std::chrono::seconds seeds_wait_time = (addrman.size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ? DNSSEEDS_DELAY_MANY_PEERS : DNSSEEDS_DELAY_FEW_PEERS);
+    for (const std::string& seed : seeds) {
+        // ...
+        if (addrman.size() > 0) {
+            // ...
+            int nRelevant = 0;
+            {
+                LOCK(cs_vNodes);
+                for (const CNode* pnode : vNodes) {
+                    if (pnode->fSuccessfullyConnected && pnode->IsFullOutboundConn()) ++nRelevant;
+                }
+            }
+            if (nRelevant >= 2) {
+                // ...
+                return;
+            }
+        }
+        if (HaveNameProxy()) {
+            AddAddrFetch(seed);
+        } else {
+            unsigned int nMaxIPs = 256; 
+            if (LookupHost(host, vIPs, nMaxIPs, true)) {
+                // ...
+                addrman.Add(vAdd, resolveSource);
+            } else {
+                AddAddrFetch(seed);
+            }
+        }
+    }
+}
+----
+
+[[thread_open_added_connections]]
+=== `ThreadOpenAddedConnections`
+
+The `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2538[threadOpenAddedConnections]` calls `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2064[GetAddedNodeInfo()]` to https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2123[get information about the nodes] added through the `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/rpc/net.cpp#L274[addnode]` RPC command or the `-connect` configuration option. These nodes are stored in `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.h#L1135[std::vector<std::string> vAddedNodes]`, which is protected by `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.h#L1136[cs_vAddedNodes]` mutex. `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2118[ThreadOpenAddedConnections()]` is a infinite loop that checks the if added addresses are connected and, if not, tries to connect to them.
+
+The connections are open using `CConnman::OpenNetworkConnection(...)` method and the type of the connection is `ConnectionType::MANUAL`. 
+
+Manual connections cannot be evicted and do not contribute to the limits of outbound-full-relay and outbound-block-relay. The limit for manual connections is defined by the constant `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.h#L66[MAX_ADDNODE_CONNECTIONS]`, whose default value is 8.
+
+[source,c++]  
+----
+void CConnman::ThreadOpenAddedConnections()
+{
+    while (true)
+    {
+        CSemaphoreGrant grant(*semAddnode);
+        std::vector<AddedNodeInfo> vInfo = GetAddedNodeInfo();
+        bool tried = false;
+        for (const AddedNodeInfo& info : vInfo) {
+            if (!info.fConnected) {
+                // ...
+                CAddress addr(CService(), NODE_NONE);
+                OpenNetworkConnection(addr, false, &grant, info.strAddedNode.c_str(), ConnectionType::MANUAL);
+                if (!interruptNet.sleep_for(std::chrono::milliseconds(500)))
+                    return;
+            }
+        }
+        // ...
+    }
+}
+----
+
+[[thread_open_connections]]
+=== `ThreadOpenConnections`
+
+`ThreadOpenConnections` initiates new connections to peers.
+
+This thread tries to fill all outbound connections. By default, the node has 8 full relay, 2 block relay and 1 Feeler connections.
+
+If the node was started with `-connect`, the thread just connects to the specified list and terminates.
+
+Then, the `next_feeler` time is defined. A Feeler connection is created on average every 2 minutes. 
+
+The `next_extra_block_relay` time is also defined. Periodically (on average every 5 minutes) the node connects to a peer (using a block-relay connection and the tregular outbound selection methodology from `addrman`) and stays connected long enough to sync headers, but not much longer. Then the peer is disconnected, if the node hasn't learned anything new. +
+The idea is to make eclipse attacks very difficult to execute, because every few minutes the node is finding a new peer to learn headers from.
+
+This thread calls `CConnman::ProcessAddrFetch()` in loop. This ensures that all ADDR_FETCH connections will be opened.
+
+Then, the thread waits until 60 seconds for addrman to fill. The ideia is check if the DNS Seeds, `-seednode` or `-addnode` will be used before fallback on to fixed seeds. If none of these options are available, it is done immediately.
+
+The fixed seeds are retrieved from `CChainParams::FixedSeeds()`. This hardcoded list contains addresses of recently active nodes on the network and is updated every release cycle. The https://github.com/bitcoin/bitcoin/pull/18506[PR #18506] is an example of the process to update the fixed seeds.
+
+Then the thread determines what type of connection to open. +
+Opening BLOCK_RELAY connections to addresses from anchors.dat gets the highest priority. Then the node opens OUTBOUND_FULL_RELAY priority until it meets the full-relay capacity. Then it opens BLOCK_RELAY connection until block-relay-only peer limit is hit.
+
+`GetTryNewOutboundPeer()` gets set when a stale tip is detected, so the node tries opening an additional OUTBOUND_FULL_RELAY connection. If none of these conditions are met, the node checks to see if it's time to try an extra block-relay-only peer (to confirm our tip is current, see below) or the next_feeler timer to decide if it should open a FEELER.
+
+The peers are selected at random from `new` and `tried` tables, so an attack cannot exploit any bias to populate the tables.
+
+This thread also checks if any to-be-evicted `tried` table entries have been tested and if so, it resolves the collisions calling `CAddrMan::ResolveCollisions()`.
+
+[source,c++]  
+----
+void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
+{
+    if (!connect.empty())
+    {
+        // ...
+        for (const std::string& strAddr : connect)
+        {
+            OpenNetworkConnection(addr, false, nullptr, strAddr.c_str(), ConnectionType::MANUAL);
+        }
+    }
+    // ...
+    while (!interruptNet)
+    {
+        // ...
+        if (add_fixed_seeds && addrman.size() == 0) {
+            // ...
+            if (add_fixed_seeds_now) {
+                // ...
+                addrman.Add(ConvertSeeds(Params().FixedSeeds()), local);
+                add_fixed_seeds = false;
+            }
+        }
+        // ...
+        ConnectionType conn_type = ConnectionType::OUTBOUND_FULL_RELAY;
+        // ...
+        if (!m_anchors.empty() && (nOutboundBlockRelay < m_max_outbound_block_relay)) {
+            conn_type = ConnectionType::BLOCK_RELAY;
+            anchor = true;
+        } else if (nOutboundFullRelay < m_max_outbound_full_relay) {
+            // OUTBOUND_FULL_RELAY
+        } else if (nOutboundBlockRelay < m_max_outbound_block_relay) {
+            conn_type = ConnectionType::BLOCK_RELAY;
+        } else if (GetTryNewOutboundPeer()) {
+            // OUTBOUND_FULL_RELAY
+        } else if (now > next_extra_block_relay && m_start_extra_block_relay_peers) {
+            next_extra_block_relay = PoissonNextSend(now, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
+            conn_type = ConnectionType::BLOCK_RELAY;
+        } else if (now > next_feeler) {
+            next_feeler = PoissonNextSend(now, FEELER_INTERVAL);
+            conn_type = ConnectionType::FEELER;
+            fFeeler = true;
+        } else {
+            // skip to next iteration of while loop
+            continue;
+        }
+
+        addrman.ResolveCollisions();
+        // ...
+    }
+}
+----
+
+[[thread_message_handler]]
+=== `ThreadMessageHandler`
+
+Almost all `net_processing` and `validation` logic runs on this thread. As long as the flag `flagInterruptMsgProc` is true, the thread continues to send and receive messages.
+
+First, `ThreadMessageHandler` randomizes the order in which messages are processed from/to our peers.  This prevents attacks in which an attacker exploits having multiple onsecutive connections in the `vNodes` list.
+
+Then, for each node, the thread calls `PeerManagerImpl::ProcessMessages(...)` to process each received message and `PeerManagerImpl::SendMessages(...)` to send message to the node.
+
+Note that these functions belong to the network processing layer. It is a higher level than the network layer and therefore messages here are handled at the protocol level, not sockets.
+
+[source,c++]  
+----
+void CConnman::ThreadMessageHandler()
+{
+    FastRandomContext rng;
+    while (!flagInterruptMsgProc)
+    {
+        // ...
+        Shuffle(vNodesCopy.begin(), vNodesCopy.end(), rng);
+
+        for (CNode* pnode : vNodesCopy)
+        {
+            if (pnode->fDisconnect)
+                continue;
+
+            // Receive messages
+            bool fMoreNodeWork = m_msgproc->ProcessMessages(pnode, flagInterruptMsgProc);
+            fMoreWork |= (fMoreNodeWork && !pnode->fPauseSend);
+            if (flagInterruptMsgProc)
+                return;
+            // Send messages
+            {
+                LOCK(pnode->cs_sendProcessing);
+                m_msgproc->SendMessages(pnode);
+            }
+
+            if (flagInterruptMsgProc)
+                return;
+        }
+        // ...
+    }
+}
+----
+
+[[summary]]
+=== Summary
+
+The `CConnman` is the class of the network layer. It starts the network operations, handles the interruption of the network and the node shutdown.
+
+The operations are performed by a few threads, including: `ThreadSocketHandler`, `ThreadDNSAddressSeed`, `ThreadOpenAddedConnections`, `ThreadOpenConnections` and `ThreadMessageHandler`.
+
+`ThreadSocketHandler manages the creation, binding and release of sockets.
+
+`ThreadDNSAddressSeed` retireves from DNS Seeds a list of IP addresses that have recently been running a Bitcoin client. Typically, this only happens the first time the user starts the node.
+
+`ThreadOpenAddedConnections` tries to connect to nodes added through the `addnode` RPC command or the `-connect` configuration option.
+
+`ThreadOpenConnections` initiates new connections to peers and tries to fill all outbound connections. It also resolves the collisions on the `new` table.
+
+`ThreadMessageHandler` bridges the gap between `net` layer and `net processing` layer. While the `net` layer handles messages at socket level, the `net processing` handles at protocol level and implements the logic for each message defined in protocol.

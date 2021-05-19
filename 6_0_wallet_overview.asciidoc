@@ -1,0 +1,226 @@
+=== Introduction
+
+The commit https://github.com/bitcoin/bitcoin/commit/65b49f60a4cf521889297b2006f66efa11d769c5[65b49f60a4] can be used as a reference for the https://github.com/bitcoin/bitcoin/tree/65b49f60a4cf521889297b2006f66efa11d769c5[project's codebase] at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 65b49f60a4
+
+=== Creating Wallet
+
+Wallets are created by `createwallet` RPC, defined in  `src/wallet/rpc/wallet.cpp`.
+
+[source,c++]
+----
+// src/wallet/rpc_wallet.cpp
+static RPCHelpMan createwallet()
+{
+    return RPCHelpMan{
+        "createwallet",
+        "\nCreates and loads a new wallet.\n",
+        {
+            ...
+        }
+    };
+}
+----
+
+There are some arguments supported by this function but the only mandatory is the wallet name (_wallet_name_ parameter).
+
+The _disable_private_keys_ and _blank_ arguments are commonly used together to create create watch-only, multisig or externally signed wallets.
+
+The _passphrase_ parameter encrypts the wallet with the passphrase. The encryption is done by `CWallet::EncryptWallet(...)` and the passphrase is used to create the master key. So if the user changes the passphrase later, a new master key and all derivation will be created again. By this reason, the user must do a new backup right after changing the passphrase.
+
+[source,c++]
+----
+// src/wallet.cpp
+bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
+{
+    CKeyingMaterial _vMasterKey;
+
+    _vMasterKey.resize(WALLET_CRYPTO_KEY_SIZE);
+    GetStrongRandBytes(_vMasterKey.data(), WALLET_CRYPTO_KEY_SIZE);
+
+    CMasterKey kMasterKey;
+
+    kMasterKey.vchSalt.resize(WALLET_CRYPTO_SALT_SIZE);
+    GetStrongRandBytes(kMasterKey.vchSalt.data(), WALLET_CRYPTO_SALT_SIZE);
+
+    // ...
+
+    if (!crypter.SetKeyFromPassphrase(strWalletPassphrase, kMasterKey.vchSalt, kMasterKey.nDeriveIterations, kMasterKey.nDerivationMethod))
+        return false;
+    if (!crypter.Encrypt(_vMasterKey, kMasterKey.vchCryptedKey))
+        return false;
+
+    {
+        // ...
+        encrypted_batch->WriteMasterKey(nMasterKeyMaxID, kMasterKey);
+        // ..
+    }
+    NotifyStatusChanged(this);
+
+    return true;
+}
+----
+
+The _avoid_reuse_ wallet flag was introduced in PR https://github.com/bitcoin/bitcoin/pull/13756[#13756], which was subsequently followed up with PR https://github.com/bitcoin/bitcoin/pull/16239[#16239] to mitigate exposure to dust attacks.
+
+Bitcoin dust refers to UTXOs with tiny values that are so small that they are economically unspendable. That is, it costs more (in transaction fees) to spend than the value of the UTXOs. It’s possible to end up with dust in the wallet due to poor UTXO management. It’s also possible to receive not requested dust deposits. This is because it is not possible to stop someone from sending funds to a valid bitcoin address and every bitcoin address that has ever received funds is publicly viewable on the blockchain.
+
+There are some reason for someone sends dust to a wallet:
+
+* To grief / annoy Bitcoin users
+* To get their attention and advertise something to them
+* To trick recipients into using more block space, jacking up the fee rates
+* To trick recipients into correlating more of their wallet addresses
+
+So, enabling _avoid_reuse_ mitigates the dust attack as follows:
+
+* avoiding spending from destinations that the wallet has previously spent from, and
+
+* attempting to sweep larger parts of the outputs to a destination when it does spend, from a destination that has multiple outputs available.
+
+To achieve this, the _avoid_reuse_ parameter, if true, adds the `WALLET_FLAG_AVOID_REUSE` flag to the wallet. This flag has impact in the wallet balance and in the available coins, disabling the funds from reused addresses.
+
+
+[source,c++]
+----
+// src/wallet.cpp
+static RPCHelpMan createwallet()
+{
+    // ...
+    if (!request.params[4].isNull() && request.params[4].get_bool()) {
+        flags |= WALLET_FLAG_AVOID_REUSE;
+    }
+    // ...
+}
+
+static RPCHelpMan getbalances()
+{
+    // ...
+    if (wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE)) {
+            const auto full_bal = GetBalance(wallet, 0, false);
+            // ...
+        }
+    // ...
+}
+
+// src/wallet.cpp
+void AvailableCoins(...)
+{
+    // ...
+    bool allow_used_addresses = !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE) || (coinControl && !coinControl->m_avoid_address_reuse);
+    // ...
+}
+----
+
+The _avoid_reuse_ can be added to the wallet after the creation via `setwalletflag` RPC.
+
+The `descriptors` parameter adds the `WALLET_FLAG_DESCRIPTORS` flag. which is used to defined the database format as SQLite. This flag also determine the way the seed will be generated for the wallet.
+
+Until version 22, legacy wallet is the default option. The https://github.com/bitcoin/bitcoin/pull/23002[PR #23002] changed this and since then, newly created wallets are descriptor by default.
+
+The _load_on_startup_ parameter was introduced in https://github.com/bitcoin/bitcoin/pull/15937[PR #15937] to maintain a persistent list of wallets stored in settings that will automatically be loaded on startup.
+
+The settings are stored in `<datadir>/settings.json` and this file was introduced in https://github.com/bitcoin/bitcoin/pull/15935[PR #15935].  This additional file may look unnecessary since there is already a configuration file, but https://github.com/bitcoin/bitcoin/pull/15935#issuecomment-490641194[the author  explains in details the motivation for this] in the PR conversation. In short, the main reasons are the standard format (JSON), maintainability, uniformity and flexibility of representation.
+
+
+The `AddWalletSetting(...)` and `RemoveWalletSetting(...)` are functions responsible to respectively add or remove a new wallet in `<datadir>/settings.json`.
+
+[source,c++]
+----
+// src/wallet/wallet.cpp
+bool AddWalletSetting(interfaces::Chain& chain, const std::string& wallet_name)
+{
+    util::SettingsValue setting_value = chain.getRwSetting("wallet");
+    if (!setting_value.isArray()) setting_value.setArray();
+    for (const util::SettingsValue& value : setting_value.getValues()) {
+        if (value.isStr() && value.get_str() == wallet_name) return true;
+    }
+    setting_value.push_back(wallet_name);
+    return chain.updateRwSetting("wallet", setting_value);
+}
+
+bool RemoveWalletSetting(interfaces::Chain& chain, const std::string& wallet_name)
+{
+    util::SettingsValue setting_value = chain.getRwSetting("wallet");
+    if (!setting_value.isArray()) return true;
+    util::SettingsValue new_value(util::SettingsValue::VARR);
+    for (const util::SettingsValue& value : setting_value.getValues()) {
+        if (!value.isStr() || value.get_str() != wallet_name) new_value.push_back(value);
+    }
+    if (new_value.size() == setting_value.size()) return true;
+    return chain.updateRwSetting("wallet", new_value);
+}
+
+//
+namespace util {
+using SettingsValue = UniValue;
+// ...
+}
+----
+
+Note that `SettingsValue` is just `UniValue` type, which is the same used for RPC JSON. The reason it is used here for convenience and because it can be easily serialized in a readable format.
+
+=== Creation Process
+
+The `createwallet()` RPC, as seen in the last section, basically handles the parameters and adds the flags according to them. There are also two important data structures that are used in wallet creation: `DatabaseOptions` and `DatabaseStatus`.
+
+[source,c++]
+----
+// src/wallet/db.h
+struct DatabaseOptions {
+    bool require_existing = false;
+    bool require_create = false;
+    std::optional<DatabaseFormat> require_format;
+    uint64_t create_flags = 0;
+    SecureString create_passphrase;
+    bool verify = true;
+};
+
+enum class DatabaseStatus {
+    SUCCESS,
+    FAILED_BAD_PATH,
+    FAILED_BAD_FORMAT,
+    FAILED_ALREADY_LOADED,
+    FAILED_ALREADY_EXISTS,
+    FAILED_NOT_FOUND,
+    FAILED_CREATE,
+    FAILED_LOAD,
+    FAILED_VERIFY,
+    FAILED_ENCRYPT,
+};
+----
+
+These structures were introduced in https://github.com/bitcoin/bitcoin/pull/19619[PR #19619] as a way to make the code more understandable and to prepare for adding SQLite support.
+
+The `require_create` field enforces the wallet path does not previously exists before creating the new one.
+
+[source,c++]
+----
+// src/wallet/walletdb.cpp
+std::unique_ptr<WalletDatabase> MakeDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error)
+{
+    bool exists;
+    try {
+        exists = fs::symlink_status(path).type() != fs::file_not_found;
+    }
+    // ...
+
+    if (format && options.require_create) {
+        error = Untranslated(strprintf("Failed to create database path '%s'. Database already exists.", fs::PathToString(path)));
+        status = DatabaseStatus::FAILED_ALREADY_EXISTS;
+        return nullptr;
+    }
+    // ...
+}
+----
+
+
+[[references]]
+=== References
+
+* https://blog.keys.casa/bitcoin-dust-attack-myths-misconceptions/[Bitcoin Dust Attack Myths & Misconceptions]
+
+* https://bitcoincore.reviews/17824[Improve coin selection for destination groups >10]

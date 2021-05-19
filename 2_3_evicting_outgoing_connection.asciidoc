@@ -1,0 +1,230 @@
+[[evicting_outgoing_connection]]
+== Evicting An Outgoing Connection
+
+Until https://github.com/bitcoin/bitcoin/pull/11490[PR #11490], there was no rotation of outbound peers. If an outbound peer stopped serving blocks for the node or was on a consensus-incompatible chain with less work than the tip of the node (but otherwise valid headers), then the node would never disconnect that peer, even though that peer was using one of the 8 outbound connection slots.
+
+Because the node relies on the outbound peers to find an honest node to reach consensus, allowing an incompatible peer to occupy one of those slots is undesirable, particularly if it is possible for all such slots to be occupied by such peers. 
+
+The PR introduced a protection against this by always checking to see if a peer's best-known block has less work than the node's tip, and if so, set a 20-minute timeout. If the peer is still not known to have caught up to a chain with as much work as the node after 20 minutes, then send a single `GETHEADERS` message, wait 2 more minutes, and if a better header has not been received by then, disconnect that peer.
+
+This change does not require the peer to synchronize with the same tip as the node, just an equal or greater work tip. (Doing otherwise would risk partitioning the network in the event of a chain split and is also unnecessary).
+
+The node picks 4 of the outbound peers and do not subject them to this logic, to be more conservative and to prevent temporary network issues (or an attacker) to excessively disrupt network topology.
+
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference for the project’s codebase at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 6d1d33d33491
+
+// TODO: check caa21f586f951d626a67f391050c3644f1057f57
+
+[[disconnecting_headers_chains_ibd]]
+=== Disconnecting from bad outbound peers with bad headers chains in IBD 
+
+When in IBD, the node needs to use all of the outbound peers to help it to synchronize the chain. Any outbound peers whose headers have insufficient work must be disconnected.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, ...)
+{
+    // ...
+    CNodeState *nodestate = State(pfrom.GetId());
+    // ...
+    if (m_chainman.ActiveChainstate().IsInitialBlockDownload() && nCount != MAX_HEADERS_RESULTS) {
+        if (nodestate->pindexBestKnownBlock && nodestate->pindexBestKnownBlock->nChainWork < nMinimumChainWork) {
+            if (pfrom.IsOutboundOrBlockRelayConn()) {
+                LogPrintf("Disconnecting outbound peer %d -- headers chain has insufficient work\n", pfrom.GetId());
+                pfrom.fDisconnect = true;
+            }
+        }
+    }
+    // ...
+}
+----
+
+The `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/validation.cpp#L1192[CChainState::IsInitialBlockDownload()]` method returns true if the node is still downloading new blocks from the peers. It is done by https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/validation.cpp#L1192[checking the `fImporting` and `fReindex` values]. These variables are defined in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/node/blockstorage.cpp#L495[ThreadImport(…​)]` to load the blocks at startup. `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/node/blockstorage.cpp#L481[CImportingNow]` (used in that thread) https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/node/blockstorage.cpp#L485[sets `fImporting` to true] when created and https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/node/blockstorage.cpp#L491[to false] when destroyed. `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/node/blockstorage.cpp#L23[fReindex]` is usually https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L1307[defined by the user] through `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L407[-reindex]` params.
+
+The other criteria to check whether the IBD is complete or not are:
+
+. Check the `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/chain.h#L403[CChain::Tip()]` value. This method returns the https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/chain.h#L404[index entry for the tip of the chain, or `nullptr` if none], which means the IBD is still running.
+
+. If the chain work for the last block is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/validation.cpp#L1192[less than the minimum chain work], then the IBD is still running. This concept was introduced in the https://github.com/bitcoin/bitcoin/pull/9053[PR #9053] and it replaced the checkpoints and is the known amount of work in the chain for the network at the time of software release.
+
+. If the time of the last block (`nTime`) is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/validation.cpp#L1207[earlier than the previous 24 hours from the current time], the IBD is still running.
+
+If none of these criteria are true, the IBD is considered completed and this result is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/validation.cpp#L1210[cached for later verification].
+
+`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L1894[nCount]` is the size of the `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/protocol.h#L127[HEADER]` message. It usually has 2,000 headers (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L101[MAX_BLOCKS_TO_ANNOUNCE]`). If the size is less than that number, then there is no more headers to fetch from the peer that sent the message. So it is safe to assess whether the peer has sufficient chain work.
+
+If the peer https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2041[has too little work on their headers chain] to help the synchronization, https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2052[it will be disconnected]. Note that the peer's tip is compared to `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/validation.cpp#L140[nMinimumChainWork]` (instead of `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/chain.h#L403[m_chainman.ActiveChain().Tip()]`) because the block download will not start until the node has a headers chain that has https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/init.cpp#L901-L903[at least the `nMinimumChainWork`].
+
+[[disconnection_bad_slow]]
+== Disconnection of outbound peers on bad/slow chains
+
+The https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2063[4 fist peers] that give the node a valid connecting header https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L2065-L2066[will not be subject to eviction] under the bad/lagging chain logic. These chain tips of these peers should have at least as much work as the node and the connection type should be outbound full relay.
+
+The reason for this protection is to prevent excessive network topology changes as a result of this algorithm, while still ensuring that the node have a reasonable number of nodes not known to be on bogus chains.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, ...)
+{
+    // ...
+    if (!pfrom.fDisconnect && pfrom.IsFullOutboundConn() && nodestate->pindexBestKnownBlock != nullptr) {
+        if (m_outbound_peers_with_protect_from_disconnect < MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT && nodestate->pindexBestKnownBlock->nChainWork >= m_chainman.ActiveChain().Tip()->nChainWork && !nodestate->m_chain_sync.m_protect) {
+            LogPrint(BCLog::NET, "Protecting outbound peer=%d from eviction\n", pfrom.GetId());
+            nodestate->m_chain_sync.m_protect = true;
+            ++m_outbound_peers_with_protect_from_disconnect;
+        }
+    }
+}
+----
+
+The limit of the peers that will be protected is defined by the constant `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L54[MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT]`, which is currently 4.
+
+To store which peers are protected and to implement the eviction logic, the `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L640[ChainSyncTimeoutState]` struct was created.
+
+[source,c++]  
+----
+struct ChainSyncTimeoutState {
+    int64_t m_timeout{0};
+    const CBlockIndex* m_work_header{nullptr};
+    bool m_sent_getheaders{false};
+    bool m_protect{false};
+};
+----
+
+This eviction logic is implemented in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3933[PeerManagerImpl::ConsiderEviction(...)]` method. Firslty, it https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3940[checks] if the peer is not protected, the connection type is outbound full relay and the node has started headers synchronization with this peer.
+
+Then, it checks if the https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3947[peer's tip is greater than the node's one]. If so, there is no need to evict the peer and the `CNodeState::m_chain_sync` is restored to its https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3949-L3951[default value] and the timeout is set to 0. Otherwise, it means that the best block known by this peer is behind the node's tip and a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3958[timeout] of 20 minutes (https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L56[CHAIN_SYNC_TIMEOUT]) is set to check the status of the peer again.
+
+The current node's chain tip https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3959[is assigned] to `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L644[CNodeState::ChainSyncTimeoutState::m_work_header]`. This field is used to verify that the peer https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3947[is sufficiently synchronized at some point] before the timeout is reached. If so, https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3949-L3951[peer will not be evicted].
+
+When the https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3961[timeout expires] and the peer’s best block is still behind the node’s tip, the https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3972[node sends a `GETHEADERS` message] and https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3980[waits] another 2 minutes (https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3974[HEADERS_RESPONSE_TIME]) for the reply. 
+
+The `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L646[CNodeState::ChainSyncTimeoutState::m_sent_getheaders]` field indicates whether the message `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/protocol.h#L117[GETHEADERS]` has already been sent or not. 
+
+If after that time, the peer's best-known block still has less work than the node's tip, https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3968[it is disconnected].
+
+Note that this logic does not require the peers to be on the same chain as the node, to prevent accidental partitioning of the network in the event of a chain split. If the peers are ever on a more work chain than the node's tip, then the node will download and validate it as usual.
+
+[[connecting_new_peer]]
+=== Connecting to a new outbound peer if the node's tip is stale
+
+The https://github.com/bitcoin/bitcoin/pull/11560[PR #11560] implements a new eviction logic. The node connects to an additional outbound peer when detects the tip looks stale. Periodically, it is checked if the node has more outbound peers than allowed. If so, disconnect the one that least recently announced a new block. It is designed to mitigate P2P disruption if all the outbound peers stop relaying blocks to us.
+
+This logic is implemented by the `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4087[PeerManagerImpl::CheckForStaleTipAndEvictPeers()]` and it is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L1298[called every 45 second], as defined in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L60[EXTRA_PEER_CHECK_INTERVAL]`.
+
+[source,c++]  
+----
+PeerManagerImpl::PeerManagerImpl(...) {
+    // ...
+    static_assert(EXTRA_PEER_CHECK_INTERVAL < STALE_CHECK_INTERVAL, "peer eviction timer should be less than stale tip check timer");
+    scheduler.scheduleEvery([this] { this->CheckForStaleTipAndEvictPeers(); }, std::chrono::seconds{EXTRA_PEER_CHECK_INTERVAL});
+    // ...
+}
+----
+
+Note that checking for extra outbound peers and disconnecting them (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L60[EXTRA_PEER_CHECK_INTERVAL]`) must be https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L1297[more frequent] than checking for stale tips (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L58[STALE_CHECK_INTERVAL]`).
+
+The https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4104[next time to check for stale tips] is stored in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L346[m_stale_tip_check_time]` variable. The default value for `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L58[STALE_CHECK_INTERVAL]` is 10 minutes.
+
+So every 10 minutes, if the node is not in IBD, the network is active and outbound connections are enabled, `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L785[TipMayBeStale()]` is called https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4098[to perform this check].
+
+[source,c++]  
+----
+bool PeerManagerImpl::TipMayBeStale()
+{
+    AssertLockHeld(cs_main);
+    const Consensus::Params& consensusParams = m_chainparams.GetConsensus();
+    if (m_last_tip_update == 0) {
+        m_last_tip_update = GetTime();
+    }
+    return m_last_tip_update < GetTime() - consensusParams.nPowTargetSpacing * 3 && mapBlocksInFlight.empty();
+}
+----
+
+This method https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L792[verifies] if the node has not received blocks for 30 minutes and if there are no blocks being downloaded. In that case, it is potentially a stale tip event and `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1732[CConnman::SetTryNewOutboundPeer(bool flag)]` is called to https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4100[enable extra outbound connections].
+
+`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/consensus/params.h#L89[nPowTargetSpacing]` is the average block time expected by the node (https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/chainparams.cpp#L78[10 minutes]). And `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L448[mapBlocksInFlight]` maps the blocks https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L740[that are being downloaded]. `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L451[m_last_tip_update]` is updated when a https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L1310[new block is connected].
+
+The node knows whether or not to connect to extra outbound  peers by https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1905[calling] `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1727[CConnman::GetTryNewOutboundPeer()]` in the thread `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1772[CConnman::ThreadOpenConnections]`.
+
+
+[source,c++]  
+----
+void PeerManagerImpl::CheckForStaleTipAndEvictPeers()
+{
+    // ...
+    EvictExtraOutboundPeers(time_in_seconds);
+
+    if (time_in_seconds > m_stale_tip_check_time) {
+        if (!fImporting && !fReindex && m_connman.GetNetworkActive() && m_connman.GetUseAddrmanOutgoing() && TipMayBeStale()) {
+            LogPrintf("Potential stale tip detected, will try using extra outbound peer (last tip update: %d seconds ago)\n", time_in_seconds - m_last_tip_update);
+            m_connman.SetTryNewOutboundPeer(true);
+        } else if (m_connman.GetTryNewOutboundPeer()) {
+            m_connman.SetTryNewOutboundPeer(false);
+        }
+        m_stale_tip_check_time = time_in_seconds + STALE_CHECK_INTERVAL;
+    }
+    
+    if (!m_initial_sync_finished && CanDirectFetch()) {
+        m_connman.StartExtraBlockRelayPeers();
+        m_initial_sync_finished = true;
+    }
+}
+----
+
+The `EvictExtraOutboundPeers()` first checks if the node https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3994[has any extra block-relay-only peers] and if so, disconnects the youngest unless it has given the node a block -- in which case, https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4006[compare with the second-youngest], and out of those two, disconnect the peer who https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4021[least recently gave the node a block].
+
+The youngest block-relay-only peer might be the extra peer that the node has temporarily connected to synchronize the node's tip. Note that higher node id (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L730[CNode::id]`) is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L3999[used as a measure for most recent connection].
+
+The peer https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4020[will only be evicted] if it has been connected longer than 30 seconds (https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L62[MINIMUM_CONNECT_TIME]) and there is no block being fetched from it. This ensures the block has been connected enough to complete the handshake.
+
+After handling the block-relay-only connections, `EvictExtraOutboundPeers()` checks whether the node https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4033[has too many outbound-full-relay peers].
+
+If so, it disconnects one, choosing the  peer that https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4051[least recently announced a new block]. If there are peers with the same announcement time (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L654[CNodeState::m_last_block_announcement]`), the one with higher node id (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L730[CNode::id]`) will be selected.
+
+Another eviction logic was implemented in the https://github.com/bitcoin/bitcoin/pull/19858[PR #19858]. To make eclipse attacks more difficult, the node regularly https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1907[initiates an extra outbound block-relay connection] and stays connected long enough to sync headers and potentially learn of new blocks. If the node learns a new block, it will https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4009[rotate out an existing block-relay peer] in favor of the new peer.
+
+As block-relay connections use minimal bandwidth, the node can make these connections regularly and
+not just when the tip is stale.
+
+Like feeler connections, these connections are not aggressive; whenever the timer fires (once every 5 minutes on average, defined in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h[EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL]`), the node will try to initiate a new block-relay connection, but if it fail to connect it just wait for the timer to fire again before repeating with a new peer.
+
+The `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h[CConnman::m_start_extra_block_relay_peers]` field enables the extra block-relay connection in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1772[CConnman::ThreadOpenConnections(...)]`. This should only be enabled after initial chain sync has occurred, as these connections are intended to be short-lived and low-bandwidth.
+
+[source,c++]  
+----
+// src/net.h
+void StartExtraBlockRelayPeers() {
+    LogPrint(BCLog::NET, "net: enabling extra block-relay-only peers\n");
+    m_start_extra_block_relay_peers = true;
+}
+// ...
+std::atomic_bool m_start_extra_block_relay_peers{false};
+
+// src/net.cpp
+void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
+{
+    // ...
+    auto next_extra_block_relay = PoissonNextSend(start, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
+
+    // ...
+    } else if (now > next_extra_block_relay && m_start_extra_block_relay_peers) {
+        next_extra_block_relay = PoissonNextSend(now, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
+        conn_type = ConnectionType::BLOCK_RELAY;
+    }
+    // ...
+}
+----
+
+[[summary]]
+=== Summary
+
+The node has two mechanisms to evict outbound peer stopped serving blocks for the node.
+
+The first one is to disconnect from bad outbound peers with bad headers chains in IBD.
+
+The second mechanism is to connect to new peers and evict the old ones if the node detects a possible stale tip event.
