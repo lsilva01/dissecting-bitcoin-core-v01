@@ -230,7 +230,104 @@ bool CConnman::AttemptToEvictConnection()
 }
 ----
 
+The `AttemptToEvictConnection()` tries to find a connection to evict when the node's inbound connections limit is reached.
 
+It retrieves each connected node from `vNodes` and verifies if each of them has the permission _"noban"_, which means the peer cannot be banned, disconnected or discouraged for misbehavior. Then, it confirms that the peer is from an inbound connection and it will not be disconnected the next time `DisconnectNodes()` runs.
+
+All candidates nodes to be evicted are allocated in the `vEvictionCandidates` vector. The `NodeEvictionCandidate` struct stores some relevant characteristics of the node connection to determine whether it should be evicted.
+
+[source,c++]  
+----
+struct NodeEvictionCandidate
+{
+    NodeId id;
+    int64_t nTimeConnected;
+    std::chrono::microseconds m_min_ping_time;
+    int64_t nLastBlockTime;
+    int64_t nLastTXTime;
+    bool fRelevantServices;
+    bool fRelayTxes;
+    bool fBloomFilter;
+    uint64_t nKeyedNetGroup;
+    bool prefer_evict;
+    bool m_is_local;
+    bool m_is_onion;
+};
+----
+
+`SelectNodeToEvict()` selects an inbound peer to evict after filtering out (protecting) peers having distinct, difficult-to-forge characteristics. The protection logic picks out fixed numbers of desirable peers per various criteria, followed by (mostly) ratios of desirable or disadvantaged peers. If any eviction candidates remain, the selection logic chooses a peer to evict.
+
+//This method is very well-commented. Each step is  
+
+The first step is to deterministically select 4 peers to protect by the net group. An attacker cannot predict which net groups will be protected.
+
+The net group key is represented by the field `nKeyedNetGroup` which is calculated at the time of the `CNode` instantiation, right after the connection has been accepted.
+
+[source,c++]  
+----
+CSipHasher CConnman::GetDeterministicRandomizer(uint64_t id) const
+{
+    return CSipHasher(nSeed0, nSeed1).Write(id);
+}
+
+uint64_t CConnman::CalculateKeyedNetGroup(const CAddress& ad) const
+{
+    std::vector<unsigned char> vchNetGroup(ad.GetGroup(addrman.m_asmap));
+
+    return GetDeterministicRandomizer(RANDOMIZER_ID_NETGROUP).Write(vchNetGroup.data(), vchNetGroup.size()).Finalize();
+}
+----
+
+`nSeed0` and `nSeed1` are also created when initializing the node and is used to construct a SipHash calculator. Then the hasher writes the arbitrary id `RANDOMIZER_ID_NETGROUP` and the net group of the node. The `Finalize()` method computes the 64-bit SipHash-2-4 of the data written.
+
+// Rule 1
+The 4 peers that have the hash with lower value will be protected from eviction.
+
+The net group, as mentioned before, is the /16 IPv4 prefix of the peer’s IP address or the ASN if the asmap file is provided.
+
+// Rule 2
+Then, the 8 peers with the lowest minimum ping time are protected. An attacker cannot manipulate this metric without physically moving nodes closer to the target.
+
+The node sends `PING` message via `MaybeSendPing(...)`. They are sent when prompted via RPC command or every 2 minutes (PING_INTERVAL constant).
+
+[source,c++]  
+----
+void PeerManagerImpl::MaybeSendPing(CNode& node_to, Peer& peer, std::chrono::microseconds now)
+{
+    // ...
+    bool pingSend = false;
+
+    if (peer.m_ping_queued) {
+        // RPC ping request by user
+        pingSend = true;
+    }
+
+    if (peer.m_ping_nonce_sent == 0 && now > peer.m_ping_start.load() + PING_INTERVAL) {
+        // Ping automatically sent as a latency probe & keepalive.
+        pingSend = true;
+    }
+    // ...
+    if (pingSend) {
+        // ...
+        if (node_to.GetCommonVersion() > BIP0031_VERSION) {
+            peer.m_ping_nonce_sent = nonce;
+            m_connman.PushMessage(&node_to, msgMaker.Make(NetMsgType::PING, nonce));
+        } else {
+            // Peer is too old to support ping command with nonce, pong will never arrive.
+            peer.m_ping_nonce_sent = 0;
+            m_connman.PushMessage(&node_to, msgMaker.Make(NetMsgType::PING));
+        }
+    }
+}
+----
+
+The BIP 31 introduced a random number that is sent with the `PING`. The response (`PONG` message) must contain this same number.
+
+Every peer has the `m_min_ping_time` field that stores the fastest time the peer replied a 'ping' message. This field is updated in the `CNode::PongReceived(...)` method which is called when the node receives a `PONG` message.
+
+This field is used to find the 8 peers with the lowest minimum ping time and protect them.
+
+// Rule 3
 
 [[references]]
 === References
