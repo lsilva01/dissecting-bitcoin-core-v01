@@ -328,6 +328,31 @@ Every peer has the `m_min_ping_time` field that stores the fastest time the peer
 This field is used to find the 8 peers with the lowest minimum ping time and protect them.
 
 // Rule 3
+Then the method protects 4 nodes that most recently sent us novel transactions accepted into our mempool. An attacker cannot manipulate this metric without performing a large amount of work.
+
+To verify this criterion, the `nLastTXTime` variable is used. Each connected peer has the `nLastTXTime` field and is always updated when a `TX` message is sent from this peer.
+
+However, it is common for a node to have more than a few peers that have not yet relayed transactions. In that case, the `nLastTXTime` will be 0 and therefore, other fields will used to evaluate this criterion. The fields are, in order of relevance: `fRelayTxes`, `fBloomFilter` and `nTimeConnected`.
+
+`fRelayTxes` is a field sent by the remote peer in the `VERSION` message, when initializing  the connection. It was added in v0.8.0 (protocol version 70001) to implement the BIP 37 specification that defines Bloom Filters and the `fRelay` field.
+
+It the field value is 0x00 (`false`), no `INV` messages or `TX` messages announcing new transactions should be sent to this peer until it sends a `FILTERLOAD` message or `FILTERCLEAR` message. If the relay field is not present or is set to 0x01, this peer wants `INV` messages and `TX` messages announcing new transactions (no change in protocol behaviour).
+
+The peers connection with `fRelayTxes` as `true` will be priorized to be protected.
+
+The next field is the `fBloomFilter`. This field has the value `true` if the peer has the Bloom filter defined (stored in `pfilter`). Otherwise, the value is `false`.
+
+To set a Bloom filter the remote peer must send a `FILTERLOAD` message. Upon receiving a `FILTERLOAD` command, the node will immediately restrict the broadcast transactions it announces (in `INV` packets) to transactions matching the filter.
+
+Other messages related to Bloom Filters are `FILTERADD` and `FILTERCLEAR`. +
+`FILTERADD` adds the provided data to the connections current filter without requiring a completely new one to be set. +
+`FILTERCLEAR` deletes the current filter and goes back to regular usage.
+
+The peers connection with empty Bloom Filters will be priorized to be protected. The idea is to prioritize connections to full nodes instead to SPV nodes.
+
+If none of the above fields can be used in evaluation, `nTimeConnected` will decide. The 4 peers with the longer connection time will be protected. 
+
+// Rule 5
 
 [[references]]
 === References
@@ -336,6 +361,10 @@ This field is used to find the 8 peers with the lowest minimum ping time and pro
 
 * https://github.com/bitcoin-core/bitcoin-devwiki/wiki/Addrman-and-eclipse-attacks[Addrman and eclipse attacks]
 
+* https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki[BIP 37]
+
 * https://core.ac.uk/download/pdf/288502346.pdf[Characterization of the topology of theBitcoin network]
 
 * https://cs-people.bu.edu/heilman/eclipse[Eclipse Attacks on Bitcoin’s Peer-to-Peer Network]
+
+* https://developer.bitcoin.org/reference/p2p_networking.html[P2P Networkf2]
