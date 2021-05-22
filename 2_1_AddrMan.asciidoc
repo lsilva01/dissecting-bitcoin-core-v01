@@ -285,6 +285,13 @@ The 4 peers that have the hash with lower value will be protected from eviction.
 
 The net group, as mentioned before, is the /16 IPv4 prefix of the peer’s IP address or the ASN if the asmap file is provided.
 
+[source,c++]  
+----
+static bool CompareNetGroupKeyed(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b) {
+    return a.nKeyedNetGroup < b.nKeyedNetGroup;
+}
+----
+
 // Rule 2
 Then, the 8 peers with the lowest minimum ping time are protected. An attacker cannot manipulate this metric without physically moving nodes closer to the target.
 
@@ -327,16 +334,44 @@ Every peer has the `m_min_ping_time` field that stores the fastest time the peer
 
 This field is used to find the 8 peers with the lowest minimum ping time and protect them.
 
+[source,c++]  
+----
+static bool ReverseCompareNodeMinPingTime(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    return a.m_min_ping_time > b.m_min_ping_time;
+}
+----
+
 // Rule 3
-Then the method protects 4 nodes that most recently sent us novel transactions accepted into our mempool. An attacker cannot manipulate this metric without performing a large amount of work.
+Then the method protects 4 nodes that most recently sent us novel transactions accepted into our mempool. An attacker cannot manipulate this metric without performing useful work.
 
 To verify this criterion, the `nLastTXTime` variable is used. Each connected peer has the `nLastTXTime` field and is always updated when a `TX` message is sent from this peer.
 
-However, it is common for a node to have more than a few peers that have not yet relayed transactions. In that case, the `nLastTXTime` will be 0 and therefore, other fields will used to evaluate this criterion. The fields are, in order of relevance: `fRelayTxes`, `fBloomFilter` and `nTimeConnected`.
+However, it is common for a node to have more than a few peers that have not yet relayed transactions. In that case, the `nLastTXTime` will be 0 and therefore, other fields will be used to evaluate this criterion. The fields are, in order of relevance: `fRelayTxes`, `fBloomFilter` and `nTimeConnected`.
 
-`fRelayTxes` is a field sent by the remote peer in the `VERSION` message, when initializing  the connection. It was added in v0.8.0 (protocol version 70001) to implement the BIP 37 specification that defines Bloom Filters and the `fRelay` field.
+`fRelayTxes` is a field sent by the remote peer in the `VERSION` message, when initializing  the connection. It was added in v0.8.0 (protocol version 70001) to implement the BIP 37 specification that defines this fied and the Bloom Filters.
 
-It the field value is 0x00 (`false`), no `INV` messages or `TX` messages announcing new transactions should be sent to this peer until it sends a `FILTERLOAD` message or `FILTERCLEAR` message. If the relay field is not present or is set to 0x01, this peer wants `INV` messages and `TX` messages announcing new transactions (no change in protocol behaviour).
+[source,c++]  
+----
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::VERSION) {
+        // ...
+        if (!vRecv.empty())
+            vRecv >> fRelay;
+        // ...
+        if (pfrom.m_tx_relay != nullptr) {
+            LOCK(pfrom.m_tx_relay->cs_filter);
+            pfrom.m_tx_relay->fRelayTxes = fRelay;
+        }
+        // ...
+    }
+    // ...
+}
+----
+
+If the field value is 0x00 (`false`), no `INV` messages or `TX` messages announcing new transactions should be sent to this peer until it sends a `FILTERLOAD` message or `FILTERCLEAR` message. If the relay field is not present or is set to 0x01, this peer wants `INV` messages and `TX` messages announcing new transactions (no change in protocol behaviour).
 
 The peers connection with `fRelayTxes` as `true` will be priorized to be protected.
 
@@ -348,11 +383,125 @@ Other messages related to Bloom Filters are `FILTERADD` and `FILTERCLEAR`. +
 `FILTERADD` adds the provided data to the connections current filter without requiring a completely new one to be set. +
 `FILTERCLEAR` deletes the current filter and goes back to regular usage.
 
-The peers connection with empty Bloom Filters will be priorized to be protected. The idea is to prioritize connections to full nodes instead to SPV nodes.
+The peers connection with empty Bloom Filters will be priorized to be protected. The idea is to prioritize connections to full nodes instead to SPV or other light nodes.
 
-If none of the above fields can be used in evaluation, `nTimeConnected` will decide. The 4 peers with the longer connection time will be protected. 
+If none of the above fields can be used in evaluation, `nTimeConnected` will decide. The 4 peers that have been connected the longest will be protected. 
+
+[source,c++]  
+----
+static bool CompareNodeTXTime(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    if (a.nLastTXTime != b.nLastTXTime) return a.nLastTXTime < b.nLastTXTime;
+    if (a.fRelayTxes != b.fRelayTxes) return b.fRelayTxes;
+    if (a.fBloomFilter != b.fBloomFilter) return a.fBloomFilter;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+// Rule 4
+The next rule is to protect up to 8 block-relay only peers that have sent novel blocks to the node. It is done by picking out the potential block-relay only peers, and then sorting them by last block time.
+
+The function starts by prioritizing pairs that have the `fRelayTxes` field set to false, since they do not relay transaction.
+
+So, for peers that have the same `fRelayTxes` value the `nLastBlockTime` field is used to make the comparison. This field is updated in the `PeerManagerImpl::ProcessBlock(...)` method, when a new block is processed.
+
+Each connected peer has this field, which is the UNIX epoch time of the last block received from the peer that the node had not yet seen (for example, not yet received from another peer). The field is updated only after the block has passed the preliminary validity checks and has been saved to disk, even if the node does not connect the block or it eventually the block connection fails. 
+
+If the some peers has the same `nLastBlockTime` (haven't sent blocks yet), the ones that have all desirable services flags will be priorized to be protected. These flags are the NODE_NETWORK, NODE_WITNESS and, if the IBD is already completed, NODE_NETWORK_LIMITED.
+
+[source,c++]  
+----
+ServiceFlags GetDesirableServiceFlags(ServiceFlags services) {
+    if ((services & NODE_NETWORK_LIMITED) && g_initial_block_download_completed) {
+        return ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
+    }
+    return ServiceFlags(NODE_NETWORK | NODE_WITNESS);
+}
+----
+
+NODE_NETWORK means that the node is capable of serving the complete block chain. It is currently set by all Bitcoin Core non pruned nodes, and is unset by SPV clients or other light clients.
+
+NODE_WITNESS indicates that a node can be asked for blocks and transactions including witness data.
+
+NODE_NETWORK_LIMITED means the same as NODE_NETWORK with the limitation of only serving the last 288 (2 day) blocks. https://github.com/bitcoin/bips/blob/master/bip-0159.mediawiki[BIP 159] details this implementation.
+
+Finally, if all there are peers with the same value for all those fields, peers that have been connected the longest will be prioritized.
+
+[source,c++]  
+----
+static bool CompareNodeBlockRelayOnlyTime(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    if (a.fRelayTxes != b.fRelayTxes) return a.fRelayTxes;
+    if (a.nLastBlockTime != b.nLastBlockTime) return a.nLastBlockTime < b.nLastBlockTime;
+    if (a.fRelevantServices != b.fRelevantServices) return b.fRelevantServices;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
 
 // Rule 5
+The next rule is to protect 4 nodes that most recently sent us novel blocks. An attacker cannot manipulate this metric without performing useful work.
+
+The most relevant field used to validate this rule is the `nLastBlockTime`, which has already been mentioned. But it is common for a node to have many peers which have not yet relayed a block, so the `fRelevantServices` and `nTimeConnected` work as a fallback.
+
+[source,c++]  
+----
+{
+    if (a.nLastBlockTime != b.nLastBlockTime) return a.nLastBlockTime < b.nLastBlockTime;
+    if (a.fRelevantServices != b.fRelevantServices) return b.fRelevantServices;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+Then the `ProtectEvictionCandidatesByRatio()` is called. The ideia here is to protect the half of the remaining nodes which have been connected the longest. To favorise the diversity of the peer connections, reserve up to (half + 2) of these protected spots for onion and localhost peers, if any, even if they're not longest uptime overall. This helps protect tor peers, which tend to be otherwise disadvantaged under our eviction criteria.
+// Rule 6
+The fist step in this method is to pick out up to 1/4 peers connected via the onion service, sorted by longest uptime.
+
+[source,c++]  
+----
+static bool CompareOnionTimeConnected(const NodeEvictionCandidate& a, const NodeEvictionCandidate& b)
+{
+    if (a.m_is_onion != b.m_is_onion) return b.m_is_onion;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+The `m_is_onion` value is defined when the connection is established according to the type of network.
+// Rule 7
+Then, it is allocated any remaining slots of the 1/4, or minimum 2 additional slots, 
+
+Then, any remaining slots of the 1/4 peers connected, or at least 2 additional slots, are allocated to localhost peers, sorted by longest uptime, as manually configured hidden services that do not use `-bind=addr[:port]=onion` will not be detected as inbound onion connections.
+
+[source,c++]  
+----
+static bool CompareLocalHostTimeConnected(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    if (a.m_is_local != b.m_is_local) return b.m_is_local;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+The value `m_is_local` is obtained through `CNetAddr::IsLocal()` function, which basically checks if the address is the IPv4 loopback (127.0.0.0/8 or 0.0.0.0/8) or the IPv6 loopback (::1/128).
+// Rule 8
+The last step in `ProtectEvictionCandidatesByRatio()` is to calculate how many peers were removed from the eviction list, and update the total number of peers to protect based on uptime.
+
+[source,c++]  
+----
+static bool ReverseCompareNodeTimeConnected(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+In this step, the `ProtectEvictionCandidatesByRatio()` ends and the processing returns to `SelectNodeToEvict()` to perfom two more validations.
+
+// Rule 9
+The first one is to check if there are any remaining peers preferred for eviction. If so, consider only them to be evicted. This happens after all the other validations since if a peer is really the best by other criteria (especially in relaying blocks) then it will be protected and should not be evicted.
+
+The field `prefer_evict` is used in this validation. This field will be true if the peer's misbehavior score exceeds the `DISCOURAGEMENT_THRESHOLD` (100 points). 
+
+
+
+
 
 [[references]]
 === References
