@@ -1,0 +1,439 @@
+[[evicting_incoming_connection]]
+== Evicting An Incoming Connection
+
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 6d1d33d33491
+
+[[eviction_mechanism]]
+=== Eviction Mechanism
+
+When the number of peers has reached the limit of maximum connections, the next connecting inbound peer will trigger the eviction mechanism.
+
+[source,c++]  
+----
+void CConnman::CreateNodeFromAcceptedSocket(...)
+{
+    // ...
+    if (nInbound >= nMaxInbound)
+    {
+        if (!AttemptToEvictConnection()) {
+            // No connection to evict, disconnect the new connection
+            LogPrint(BCLog::NET, "failed to find an eviction candidate - connection dropped (full)\n");
+            CloseSocket(hSocket);
+            return;
+        }
+    }
+    // ...
+}
+----
+
+This eviction mechanism was implemented in the PR #6374 to prevent DoS attacks, allowing  new incoming connections to evict old incoming connections. Since connection slots are a limited resource, they can be the target of this type of attack.
+
+A DoS connection exhaustion attack is when an adversary fills all available incoming connection slots on the network, then overtakes the outbounds for a victim just starting up. Mitigating this issue it is important to take steps to avoid network partitioning. 
+
+However, this mechanism introduced the possibility of an attacker purposely evict connections. Before that, a successful Eclipse Attack required victim node to be restarted. Today, an attacker might be able to eclipse a node without reboots via connection eviction logic.
+
+Since reboots are no longer needed to perform Eclipse attacks, anchors connections (Eclipse countermeasure #5) provide less security improvements against such attacks.
+
+Even so, this mechanism might increase security. Half of the inbound connections are reserved for the longest running connections and there are several metrics to decide whether a connection will be evicted or not. This makes it much harder for an attacker to dominate in every category than it is to just dominate in a single metric.
+
+[source,c++]  
+----
+bool CConnman::AttemptToEvictConnection()
+{
+    std::vector<NodeEvictionCandidate> vEvictionCandidates;
+    {
+        LOCK(cs_vNodes);
+        for (const CNode* node : vNodes) {
+            if (node->HasPermission(PF_NOBAN))
+                continue;
+            if (!node->IsInboundConn())
+                continue;
+            if (node->fDisconnect)
+                continue;
+            // ...
+            NodeEvictionCandidate candidate = {...};
+            vEvictionCandidates.push_back(candidate);
+        }
+    }
+    const std::optional<NodeId> node_id_to_evict = SelectNodeToEvict(std::move(vEvictionCandidates));
+    // ...
+}
+----
+
+The `AttemptToEvictConnection()` tries to find a connection to evict when the node's inbound connections limit is reached.
+
+It retrieves each connected node from `vNodes` and verifies if each of them has the permission _"noban"_, which means the peer cannot be banned, disconnected or discouraged for misbehavior. Then, it confirms that the peer is from an inbound connection and it will not be disconnected the next time `DisconnectNodes()` runs.
+
+All candidates nodes to be evicted are allocated in the `vEvictionCandidates` vector. The `NodeEvictionCandidate` struct stores some relevant characteristics of the node connection to determine whether it should be evicted.
+
+[source,c++]  
+----
+struct NodeEvictionCandidate
+{
+    NodeId id;
+    int64_t nTimeConnected;
+    std::chrono::microseconds m_min_ping_time;
+    int64_t nLastBlockTime;
+    int64_t nLastTXTime;
+    bool fRelevantServices;
+    bool fRelayTxes;
+    bool fBloomFilter;
+    uint64_t nKeyedNetGroup;
+    bool prefer_evict;
+    bool m_is_local;
+    bool m_is_onion;
+};
+----
+
+`SelectNodeToEvict()` selects an inbound peer to evict after filtering out (protecting) peers having distinct, difficult-to-forge characteristics. The protection logic picks out fixed numbers of desirable peers per various criteria, followed by (mostly) ratios of desirable or disadvantaged peers. If any eviction candidates remain, the selection logic chooses a peer to evict.
+
+The first step is to deterministically select 4 peers to protect by the network group. An attacker cannot predict which network groups will be protected.
+
+The network group key is represented by the field `nKeyedNetGroup` which is calculated at the time of the `CNode` instantiation, right after the connection has been accepted.
+
+[source,c++]  
+----
+CSipHasher CConnman::GetDeterministicRandomizer(uint64_t id) const
+{
+    return CSipHasher(nSeed0, nSeed1).Write(id);
+}
+
+uint64_t CConnman::CalculateKeyedNetGroup(const CAddress& ad) const
+{
+    std::vector<unsigned char> vchNetGroup(ad.GetGroup(addrman.m_asmap));
+
+    return GetDeterministicRandomizer(RANDOMIZER_ID_NETGROUP).Write(vchNetGroup.data(), vchNetGroup.size()).Finalize();
+}
+----
+
+`nSeed0` and `nSeed1` are also created when initializing the node and is used to construct a SipHash calculator. Then the hasher writes the arbitrary id `RANDOMIZER_ID_NETGROUP` and the network group of the node. The `Finalize()` method computes the 64-bit SipHash-2-4 of the data written.
+
+// Rule 1
+The 4 peers that have the hash with the highest value will be protected from eviction.
+
+The network group, as mentioned before, is the /16 IPv4 prefix of the peer’s IP address or the ASN if the asmap file is provided.
+
+[source,c++]  
+----
+static bool CompareNetGroupKeyed(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b) {
+    return a.nKeyedNetGroup < b.nKeyedNetGroup;
+}
+----
+
+// Rule 2
+Then, the 8 peers with the lowest minimum ping time are protected. An attacker cannot manipulate this metric without physically moving nodes closer to the target.
+
+The node sends `PING` message via `MaybeSendPing(...)`. They are sent when prompted via RPC command or every 2 minutes (PING_INTERVAL constant).
+
+[source,c++]  
+----
+void PeerManagerImpl::MaybeSendPing(CNode& node_to, Peer& peer, std::chrono::microseconds now)
+{
+    // ...
+    bool pingSend = false;
+
+    if (peer.m_ping_queued) {
+        // RPC ping request by user
+        pingSend = true;
+    }
+
+    if (peer.m_ping_nonce_sent == 0 && now > peer.m_ping_start.load() + PING_INTERVAL) {
+        // Ping automatically sent as a latency probe & keepalive.
+        pingSend = true;
+    }
+    // ...
+    if (pingSend) {
+        // ...
+        if (node_to.GetCommonVersion() > BIP0031_VERSION) {
+            peer.m_ping_nonce_sent = nonce;
+            m_connman.PushMessage(&node_to, msgMaker.Make(NetMsgType::PING, nonce));
+        } else {
+            // Peer is too old to support ping command with nonce, pong will never arrive.
+            peer.m_ping_nonce_sent = 0;
+            m_connman.PushMessage(&node_to, msgMaker.Make(NetMsgType::PING));
+        }
+    }
+}
+----
+
+The BIP 31 introduced a random number that is sent with the `PING`. The response (`PONG` message) must contain this same number.
+
+Every peer has the `m_min_ping_time` field that stores the fastest time the peer replied a 'ping' message. This field is updated in the `CNode::PongReceived(...)` method which is called when the node receives a `PONG` message.
+
+This field is used to find the 8 peers with the lowest minimum ping time and protect them.
+
+[source,c++]  
+----
+static bool ReverseCompareNodeMinPingTime(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    return a.m_min_ping_time > b.m_min_ping_time;
+}
+----
+
+// Rule 3
+Then the method protects 4 nodes that most recently sent us novel transactions accepted into our mempool. An attacker cannot manipulate this metric without performing useful work.
+
+To verify this criterion, the `nLastTXTime` variable is used. Each connected peer has the `nLastTXTime` field and is always updated when a `TX` message is sent from this peer.
+
+However, it is common for a node to have more than a few peers that have not yet relayed transactions. In that case, the `nLastTXTime` will be 0 and therefore, other fields will be used to evaluate this criterion. The fields are, in order of relevance: `fRelayTxes`, `fBloomFilter` and `nTimeConnected`.
+
+`fRelayTxes` is a field sent by the remote peer in the `VERSION` message, when initializing  the connection. It was added in v0.8.0 (protocol version 70001) to implement the BIP 37 specification that defines this fied and the Bloom Filters.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, ...)
+{
+    // ...
+    if (msg_type == NetMsgType::VERSION) {
+        // ...
+        if (!vRecv.empty())
+            vRecv >> fRelay;
+        // ...
+        if (pfrom.m_tx_relay != nullptr) {
+            LOCK(pfrom.m_tx_relay->cs_filter);
+            pfrom.m_tx_relay->fRelayTxes = fRelay;
+        }
+        // ...
+    }
+    // ...
+}
+----
+
+If the field value is 0x00 (`false`), no `INV` messages or `TX` messages announcing new transactions should be sent to this peer until it sends a `FILTERLOAD` message or `FILTERCLEAR` message. If the relay field is not present or is set to 0x01, this peer wants `INV` messages and `TX` messages announcing new transactions (no change in protocol behaviour).
+
+The peers connection with `fRelayTxes` as `true` will be priorized to be protected.
+
+The next field is the `fBloomFilter`. This field has the value `true` if the peer has the Bloom filter defined (stored in `pfilter`). Otherwise, the value is `false`.
+
+To set a Bloom filter the remote peer must send a `FILTERLOAD` message. Upon receiving a `FILTERLOAD` command, the node will immediately restrict the broadcast transactions it announces (in `INV` packets) to transactions matching the filter.
+
+Other messages related to Bloom Filters are `FILTERADD` and `FILTERCLEAR`. +
+`FILTERADD` adds the provided data to the connections current filter without requiring a completely new one to be set. +
+`FILTERCLEAR` deletes the current filter and goes back to regular usage.
+
+The peers connection with empty Bloom Filters will be priorized to be protected. The idea is to prioritize connections to full nodes instead to SPV or other light nodes.
+
+If none of the above fields can be used in evaluation, `nTimeConnected` will decide. The 4 peers that have been connected the longest will be protected. 
+
+[source,c++]  
+----
+static bool CompareNodeTXTime(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    if (a.nLastTXTime != b.nLastTXTime) return a.nLastTXTime < b.nLastTXTime;
+    if (a.fRelayTxes != b.fRelayTxes) return b.fRelayTxes;
+    if (a.fBloomFilter != b.fBloomFilter) return a.fBloomFilter;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+// Rule 4
+The next rule is to protect up to 8 block-relay only peers that have sent novel blocks to the node. It is done by picking out the potential block-relay only peers, and then sorting them by last block time.
+
+The function starts by prioritizing pairs that have the `fRelayTxes` field set to false, since they do not relay transaction.
+
+So, for peers that have the same `fRelayTxes` value the `nLastBlockTime` field is used to make the comparison. This field is updated in the `PeerManagerImpl::ProcessBlock(...)` method, when a new block is processed.
+
+Each connected peer has this field, which is the UNIX epoch time of the last block received from the peer that the node had not yet seen (for example, not yet received from another peer). The field is updated only after the block has passed the preliminary validity checks and has been saved to disk, even if the node does not connect the block or it eventually the block connection fails. 
+
+If the some peers has the same `nLastBlockTime` (haven't sent blocks yet), the ones that have all desirable services flags will be priorized to be protected. These flags are the NODE_NETWORK, NODE_WITNESS and, if the IBD is already completed, NODE_NETWORK_LIMITED.
+
+[source,c++]  
+----
+ServiceFlags GetDesirableServiceFlags(ServiceFlags services) {
+    if ((services & NODE_NETWORK_LIMITED) && g_initial_block_download_completed) {
+        return ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
+    }
+    return ServiceFlags(NODE_NETWORK | NODE_WITNESS);
+}
+----
+
+NODE_NETWORK means that the node is capable of serving the complete block chain. It is currently set by all Bitcoin Core non pruned nodes, and is unset by SPV clients or other light clients.
+
+NODE_WITNESS indicates that a node can be asked for blocks and transactions including witness data.
+
+NODE_NETWORK_LIMITED means the same as NODE_NETWORK with the limitation of only serving the last 288 (2 day) blocks. https://github.com/bitcoin/bips/blob/master/bip-0159.mediawiki[BIP 159] details this implementation.
+
+Finally, if all there are peers with the same value for all those fields, peers that have been connected the longest will be prioritized.
+
+[source,c++]  
+----
+static bool CompareNodeBlockRelayOnlyTime(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    if (a.fRelayTxes != b.fRelayTxes) return a.fRelayTxes;
+    if (a.nLastBlockTime != b.nLastBlockTime) return a.nLastBlockTime < b.nLastBlockTime;
+    if (a.fRelevantServices != b.fRelevantServices) return b.fRelevantServices;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+// Rule 5
+The next rule is to protect 4 nodes that most recently sent us novel blocks. An attacker cannot manipulate this metric without performing useful work.
+
+The most relevant field used to validate this rule is the `nLastBlockTime`, which has already been mentioned. But it is common for a node to have many peers which have not yet relayed a block, so the `fRelevantServices` and `nTimeConnected` work as a fallback.
+
+[source,c++]  
+----
+{
+    if (a.nLastBlockTime != b.nLastBlockTime) return a.nLastBlockTime < b.nLastBlockTime;
+    if (a.fRelevantServices != b.fRelevantServices) return b.fRelevantServices;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+Then the `ProtectEvictionCandidatesByRatio()` is called. The ideia here is to protect the half of the remaining nodes which have been connected the longest. To favorise the diversity of the peer connections, reserve up to (half + 2) of these protected spots for onion and localhost peers, if any, even if they're not longest uptime overall. This helps protect tor peers, which tend to be otherwise disadvantaged under our eviction criteria.
+// Rule 6
+The fist step in this method is to pick out up to 1/4 peers connected via the onion service, sorted by longest uptime.
+
+[source,c++]  
+----
+static bool CompareOnionTimeConnected(const NodeEvictionCandidate& a, const NodeEvictionCandidate& b)
+{
+    if (a.m_is_onion != b.m_is_onion) return b.m_is_onion;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+The `m_is_onion` value is defined when the connection is established according to the type of network.
+// Rule 7
+Then, it is allocated any remaining slots of the 1/4, or minimum 2 additional slots, 
+
+Then, any remaining slots of the 1/4 peers connected, or at least 2 additional slots, are allocated to localhost peers, sorted by longest uptime, as manually configured hidden services that do not use `-bind=addr[:port]=onion` will not be detected as inbound onion connections.
+
+[source,c++]  
+----
+static bool CompareLocalHostTimeConnected(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    if (a.m_is_local != b.m_is_local) return b.m_is_local;
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+The value `m_is_local` is obtained through `CNetAddr::IsLocal()` function, which basically checks if the address is the IPv4 loopback (127.0.0.0/8 or 0.0.0.0/8) or the IPv6 loopback (::1/128).
+// Rule 8
+The last step in `ProtectEvictionCandidatesByRatio()` is to calculate how many peers were removed from the eviction list, and update the total number of peers to protect based on uptime. This number corresponds to half of the total connected nodes.
+
+[source,c++]  
+----
+static bool ReverseCompareNodeTimeConnected(const NodeEvictionCandidate &a, const NodeEvictionCandidate &b)
+{
+    return a.nTimeConnected > b.nTimeConnected;
+}
+----
+
+Then, the `ProtectEvictionCandidatesByRatio()` ends and the processing returns to `SelectNodeToEvict()` to perfom two more validations.
+
+// Rule 9
+The first one is to check if there are any remaining peers preferred for eviction. If so, consider only them to be evicted. This happens after all the other validations since if a peer is really the best by other criteria (especially in relaying blocks) then it will be protected and should not be evicted.
+
+The field `prefer_evict` is used in this validation. This field will be true if the peer's misbehavior score exceeds the `DISCOURAGEMENT_THRESHOLD` (100 points). 
+
+// Rule 10
+The last eviction rule is to identify the network group with the most connections and evict the youngest member (which are connected for less time).
+
+The `vEvictionCandidates` is already sorted by reverse connect time. Therefore, the function loops through the list checking the `nKeyedNetGroup` field and counting the size per network group. The peer belonging to the largest group and with the lowest connection time will be disconnected.
+
+[source,c++]  
+----
+[[nodiscard]] std::optional<NodeId> SelectNodeToEvict(std::vector<NodeEvictionCandidate>&& vEvictionCandidates)
+{
+    // ....
+    std::map<uint64_t, std::vector<NodeEvictionCandidate> > mapNetGroupNodes;
+    for (const NodeEvictionCandidate &node : vEvictionCandidates) {
+        std::vector<NodeEvictionCandidate> &group = mapNetGroupNodes[node.nKeyedNetGroup];
+        group.push_back(node);
+        const int64_t grouptime = group[0].nTimeConnected;
+
+        if (group.size() > nMostConnections || (group.size() == nMostConnections && grouptime > nMostConnectionsTime)) {
+            nMostConnections = group.size();
+            nMostConnectionsTime = grouptime;
+            naMostConnections = node.nKeyedNetGroup;
+        }
+    }
+
+    // Reduce to the network group with the most connections
+    vEvictionCandidates = std::move(mapNetGroupNodes[naMostConnections]);
+
+    // Disconnect from the network group with the most connections
+    return vEvictionCandidates.front().id;
+}
+----
+
+[[summary]]
+=== Summary
+
+The following table summarizes the rules. +
+Note that until the 9th rule, it is about the peers that will be protected. +
+The 9th and 10th rules are about the peer that will be disconnected.
+
+|===
+|# |Rule | Main Criterion | Other Criteria
+
+| 1 
+| Protect 4 peers with the highest network group
+| `CNetAddr::GetGroup()` (highest) 
+| 
+
+| 2
+| Protect 8 peers with the lowest minimum ping time
+| `CNetAddr::m_min_ping_time` (lowest)
+| 
+
+| 3
+| Protect 4 peers that most recently sent us novel transactions
+| `CNetAddr::nLastTXTime` (highest)
+a| `CNode::TxRelay::fRelayTxes` (true) +
+`CNode::TxRelay::pfilter` (empty) +
+`CNode::nTimeConnected` (highest)
+
+| 4
+| Protect up to 8 block-relay only peers that have sent novel blocks
+| `CNode::TxRelay::fRelayTxes` (false)
+a| `CNode::nLastBlockTime` (highest) +
+`HasAllDesirableServiceFlags()` (true) +
+`CNode::nTimeConnected` (highest)
+
+| 5
+| Protect 4 peers that most recently sent us novel blocks
+| `CNode::nLastBlockTime` (highest)
+a| `HasAllDesirableServiceFlags()` (true) +
+`CNode::nTimeConnected` (highest)
+
+| 6
+| Protect up to 1/4 peers connected via the onion service
+| `CNode::m_inbound_onion` (true)
+a| `CNode::nTimeConnected` (highest)
+
+| 7
+| Any remaining slots of the 1/4 peers connected, or at least 2 additional slots, are allocated to protect localhost peers
+| `CNetAddr::IsLocal()` (true)
+a| `CNode::nTimeConnected` (highest)
+
+| 8
+| Protect the remaining peers until completing half of them all, prioritizing those with longest uptime
+| `CNode::nTimeConnected` (highest)
+|
+
+| 9
+| Consider only the peers preferred for eviction to be disconnected
+| `CNode::m_prefer_evict` (true)
+|
+
+| 10
+| Identify the network group with the most connections and evict the youngest member
+| `CNetAddr::GetGroup()` (with the most connections)
+| `CNode::nTimeConnected` (lowest)
+
+|===
+
+[[references]]
+=== References
+
+* https://github.com/bitcoin-core/bitcoin-devwiki/wiki/Addrman-and-eclipse-attacks[Addrman and eclipse attacks]
+
+* https://github.com/bitcoin/bips/blob/master/bip-0037.mediawiki[BIP 37]
+
+* https://developer.bitcoin.org/reference/p2p_networking.html[P2P Network]
