@@ -1,0 +1,58 @@
+[[evicting_outgoing_connection]]
+== Evicting An Outgoing Connection
+
+Until PR #11490, there was no rotation of outbound peers. If an outbound peer stopped serving blocks for the node, or was on a consensus-incompatible chain with less work than the tip of the node (but otherwise valid headers), then the node would never disconnect that peer, even though that peer was using one of our 8 outbound connection slots.
+
+Because the node relies on the outbound peers to find an honest node in order to reach consensus, allowing an incompatible peer to occupy one of those slots is undesirable, particularly if it is possible for all such slots to be occupied by such peers. 
+
+The PR introduced a protection against this by always checking to see if a peer's best known block has less work than our tip, and if so, set a 20 minute timeout. If the peer is still not known to have caught up to a chain with as much work as the node after 20 minutes, then send a single getheaders message, wait 2 more minutes, and if a better header hasn't been received by then, disconnect that peer.
+
+This change does not require the peer to synchronize with the same tip as the node, just an equal or greater work tip. (Doing otherwise would risk partitioning the network in the event of a chain split, and is also unnecessary.)
+
+The node picks 4 of the outbound peers and do not subject them to this logic, to be more conservative and to prevent temporary network issues (or an attacker) to excessively disrupt network topology.
+
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch 6d1d33d33491
+
+=== Disconnecting from bad outbound peers in IBD 
+
+When in IBD, the node needs to use all of the outbound peers to help it to synchronize the chain. Any outbound peers whose headers have insufficient work must be disconnected.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, ...)
+{
+    // ...
+    CNodeState *nodestate = State(pfrom.GetId());
+    // ...
+    if (m_chainman.ActiveChainstate().IsInitialBlockDownload() && nCount != MAX_HEADERS_RESULTS) {
+        if (nodestate->pindexBestKnownBlock && nodestate->pindexBestKnownBlock->nChainWork < nMinimumChainWork) {
+            if (pfrom.IsOutboundOrBlockRelayConn()) {
+                LogPrintf("Disconnecting outbound peer %d -- headers chain has insufficient work\n", pfrom.GetId());
+                pfrom.fDisconnect = true;
+            }
+        }
+    }
+    // ...
+}
+----
+
+The `CChainState::IsInitialBlockDownload()` method returns true if the node is still downloading new blocks from the peers. It is done by checking the `fImporting` and `fReindex` values. These variables are defined in `ThreadImport(…​)` to load the blocks at startup. `CImportingNow` (used in that thread) sets `fImporting` to true when created and to false when destroyed. `fReindex` is usually defined by the user through `-reindex` params.
+
+The other criteria to check whether the IBD is complete or not are:
+
+1) Check the `CChain::Tip()` value. This method returns the index entry for the tip of the chain, or `nullptr` if none, which means the IBD is still running.
+
+2) If the the chain work for the last block is less than minimum chain work, then the IBD is still running. This concept was introduced in the the https://github.com/bitcoin/bitcoin/pull/9053[PR #9053] and it replaced the checkpoints and is the known amount of work in the chain for the network at the time of software release.
+
+3) If the time of the last block (`nTime`) is earlier than the previous 24 hours from the current time, the IBD is still running.
+
+If none of these criteria are true, the IBD is considered completed and this result is cached for later verification.
+
+`nCount` is the size of the `HEADER` message. It usually has 2,000 headers (`MAX_BLOCKS_TO_ANNOUNCE`). If the size is less than that number, then there is no more headers to fetch from the peer that sent the message. So it is safe to assess whether the peer has sufficient chain work.
+
+If the peer has too little work on their headers chain to help the synchronization, it will be disconnected. Note that the peer's tip is compared to `nMinimumChainWork` (instead of `m_chainman.ActiveChain().Tip()`) because the block download will not start until the node has a headers chain that has at least the `nMinimumChainWork`.
+

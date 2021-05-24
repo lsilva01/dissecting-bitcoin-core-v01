@@ -401,7 +401,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
 // ---
 Note that `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.h#L864[m_load_block]` is a member field of the `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.h#L807[ChainstateManager]` class. Originally, it was a global variable called `g_load_block` but has been changed in the https://github.com/bitcoin/bitcoin/pull/21575[PR #21575] for the purpose of breaking down the `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/init.cpp[src/init.cpp]` into smaller logical units. +
-ttps://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.h#L807[ChainstateManager] will be explained in the in <<validationhcpp>> section.
+`https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.h#L807[ChainstateManager]` will be explained in the in <<validationhcpp>> section.
 
 [[servicing-rpc-calls]]
 === Servicing RPC Calls

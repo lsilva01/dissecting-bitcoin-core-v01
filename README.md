@@ -75,6 +75,7 @@ Proposal: Review and update of the book "Dissection of Bitcoin"
   * [Eviction Mechanism](2_2_evicting_incoming_connection.asciidoc#eviction_mechanism)
   * [Summary](2_2_evicting_incoming_connection.asciidoc#summary)
   * [References](2_2_evicting_incoming_connection.asciidoc#references)
+* [Evicting An Outgoing Connection](2_3_evicting_outgoing_connection.asciidoc)
 * [Adresses](2_1_bitcoin_address.asciidoc)
 * [Transactions](2_2_transactions.asciidoc)
 * [Serialization](3_0_serialization.asciidoc)
