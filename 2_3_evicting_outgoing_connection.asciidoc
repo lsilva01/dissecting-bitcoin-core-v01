@@ -17,7 +17,8 @@ The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e
  cd bitcoin
  git checkout -b text_branch 6d1d33d33491
 
-=== Disconnecting from bad outbound peers in IBD 
+[[disconnecting_headers_chains_ibd]]
+=== Disconnecting from bad outbound peers with bad headers chains in IBD 
 
 When in IBD, the node needs to use all of the outbound peers to help it to synchronize the chain. Any outbound peers whose headers have insufficient work must be disconnected.
 
@@ -44,11 +45,11 @@ The `CChainState::IsInitialBlockDownload()` method returns true if the node is s
 
 The other criteria to check whether the IBD is complete or not are:
 
-1) Check the `CChain::Tip()` value. This method returns the index entry for the tip of the chain, or `nullptr` if none, which means the IBD is still running.
+. Check the `CChain::Tip()` value. This method returns the index entry for the tip of the chain, or `nullptr` if none, which means the IBD is still running.
 
-2) If the the chain work for the last block is less than minimum chain work, then the IBD is still running. This concept was introduced in the the https://github.com/bitcoin/bitcoin/pull/9053[PR #9053] and it replaced the checkpoints and is the known amount of work in the chain for the network at the time of software release.
+. If the the chain work for the last block is less than minimum chain work, then the IBD is still running. This concept was introduced in the the https://github.com/bitcoin/bitcoin/pull/9053[PR #9053] and it replaced the checkpoints and is the known amount of work in the chain for the network at the time of software release.
 
-3) If the time of the last block (`nTime`) is earlier than the previous 24 hours from the current time, the IBD is still running.
+. If the time of the last block (`nTime`) is earlier than the previous 24 hours from the current time, the IBD is still running.
 
 If none of these criteria are true, the IBD is considered completed and this result is cached for later verification.
 
@@ -56,3 +57,129 @@ If none of these criteria are true, the IBD is considered completed and this res
 
 If the peer has too little work on their headers chain to help the synchronization, it will be disconnected. Note that the peer's tip is compared to `nMinimumChainWork` (instead of `m_chainman.ActiveChain().Tip()`) because the block download will not start until the node has a headers chain that has at least the `nMinimumChainWork`.
 
+[[disconnection_bad_slow]]
+== Disconnection of outbound peers on bad/slow chains
+
+The 4 fist peers that gave us a valid connecting header, their the chain tips has at least as much work as the node and the connection type is outbound full relay will not be subject to eviction under the bad/lagging chain logic.
+
+The reason for this protection is to prevent excessive network topology changes as a result of this algorithm, while still ensuring that the node have a reasonable number of nodes not known to be on bogus chains.
+
+[source,c++]  
+----
+void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, ...)
+{
+    // ...
+    if (!pfrom.fDisconnect && pfrom.IsFullOutboundConn() && nodestate->pindexBestKnownBlock != nullptr) {
+        if (m_outbound_peers_with_protect_from_disconnect < MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT && nodestate->pindexBestKnownBlock->nChainWork >= m_chainman.ActiveChain().Tip()->nChainWork && !nodestate->m_chain_sync.m_protect) {
+            LogPrint(BCLog::NET, "Protecting outbound peer=%d from eviction\n", pfrom.GetId());
+            nodestate->m_chain_sync.m_protect = true;
+            ++m_outbound_peers_with_protect_from_disconnect;
+        }
+    }
+}
+----
+
+The limit of the peers that will be protected is defined by the constant `MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT`, which is currently 4.
+
+To store which peers are protected and to implement the eviction logic, the `ChainSyncTimeoutState` struct was created.
+
+[source,c++]  
+----
+struct ChainSyncTimeoutState {
+    int64_t m_timeout{0};
+    const CBlockIndex* m_work_header{nullptr};
+    bool m_sent_getheaders{false};
+    bool m_protect{false};
+};
+----
+
+This eviction logic is implemented in `PeerManagerImpl::ConsiderEviction(...)` method. Firslty, it checks the peer is not protected, the connection type is outbound full relay and the node has started headers synchronization with this peer.
+
+Then, it checks if the peer's tip is greater than the node. If so, there is no need to evict the peer and the `CNodeState::m_chain_sync` is restored to its default value and the timeout is set to 0. Otherwise, it means that the best block known by this peer is behind the node's tip and a timeout of 20 minutes (CHAIN_SYNC_TIMEOUT) is set to check the status of the peer again.
+
+When this timeout expires and the peer's best block is still behind the node's tip, so the node sends `GETHEADERS` message and waits another 2 minutes (HEADERS_RESPONSE_TIME) for the reply.
+
+If after that time, the peer's best known block still has less work than the node's tip, it is disconnected.
+
+Note that this logic does not require the peers to be on the same chain as the node, to prevent accidental partitioning of the network in the event of a chain split. If the peers are ever on a more work chain than the node's tip, then the node will download and validate it as usual.
+
+[[connecting_new_peer]]
+=== Connecting to a new outbound peer if the node's tip is stale
+
+The PR #11560 implements a new eviction logic. The node connects to an additional outbound peer when detects the tip looks stale. Periodically, it is checked if the node have more outbound peers than allowed. If so, disconnect the one that least recently announced a new block. It is designed to mitigate P2P disruption in the event that all our outbound peers stop relaying blocks to us.
+
+This logic is implemented by the `PeerManagerImpl::CheckForStaleTipAndEvictPeers()` and it is called every 45 second,as defined in EXTRA_PEER_CHECK_INTERVAL.
+
+[source,c++]  
+----
+PeerManagerImpl::PeerManagerImpl(...) {
+    // ...
+    static_assert(EXTRA_PEER_CHECK_INTERVAL < STALE_CHECK_INTERVAL, "peer eviction timer should be less than stale tip check timer");
+    scheduler.scheduleEvery([this] { this->CheckForStaleTipAndEvictPeers(); }, std::chrono::seconds{EXTRA_PEER_CHECK_INTERVAL});
+    // ...
+}
+----
+
+Note that checking for extra outbound peers and disconnecting them (EXTRA_PEER_CHECK_INTERVAL) must be more frequent than checking for stale tips (STALE_CHECK_INTERVAL).
+
+The next time to check for stale tips is stored in `m_stale_tip_check_time` variable. The default value for `STALE_CHECK_INTERVAL` is 10 minutes.
+
+So every 10 minutes, if the node is not in IBD, the network is active and outbound connections are enabled, `TipMayBeStale()` is called to perform this check.
+
+[source,c++]  
+----
+bool PeerManagerImpl::TipMayBeStale()
+{
+    AssertLockHeld(cs_main);
+    const Consensus::Params& consensusParams = m_chainparams.GetConsensus();
+    if (m_last_tip_update == 0) {
+        m_last_tip_update = GetTime();
+    }
+    return m_last_tip_update < GetTime() - consensusParams.nPowTargetSpacing * 3 && mapBlocksInFlight.empty();
+}
+----
+
+This method verifies if the node has not received blocks for 30 minutes and if there are no blocks being downloaded. In that case, it is potentially a stale tip event and `CConnman::SetTryNewOutboundPeer(bool flag)` is called to enable extra outbound connections.
+
+`nPowTargetSpacing` is the average block time expected by the node. And `mapBlocksInFlight` maps the blocks that are being downloaded. `m_last_tip_update` is updated when a new block is connected.
+
+The node knows whether or not to connect to extra outbound  peers by calling `CConnman::GetTryNewOutboundPeer()` in the thread `CConnman::ThreadOpenConnections`.
+
+
+[source,c++]  
+----
+void PeerManagerImpl::CheckForStaleTipAndEvictPeers()
+{
+    // ...
+    EvictExtraOutboundPeers(time_in_seconds);
+
+    if (time_in_seconds > m_stale_tip_check_time) {
+        if (!fImporting && !fReindex && m_connman.GetNetworkActive() && m_connman.GetUseAddrmanOutgoing() && TipMayBeStale()) {
+            LogPrintf("Potential stale tip detected, will try using extra outbound peer (last tip update: %d seconds ago)\n", time_in_seconds - m_last_tip_update);
+            m_connman.SetTryNewOutboundPeer(true);
+        } else if (m_connman.GetTryNewOutboundPeer()) {
+            m_connman.SetTryNewOutboundPeer(false);
+        }
+        m_stale_tip_check_time = time_in_seconds + STALE_CHECK_INTERVAL;
+    }
+    // ...
+}
+----
+
+The `EvictExtraOutboundPeers()` first checks if the node has any extra block-relay-only peers and if so, disconnects the youngest unless it has given the node a block -- in which case, compare with the second-youngest, and out of those two, disconnect the peer who least recently gave the node a block.
+
+The youngest block-relay-only peer might be the extra peer that the node has temporarily connected to synchronize the node's tip. Note that higher node id (CNode::id) is used as a measure for most recent connection.
+
+The peer will only be evicted if it has been connected longer than 30 second (MINIMUM_CONNECT_TIME) and there is no block being fetched from it. This ensures the block has been connected enough to complete the handshake.
+
+After handling the block-relay-only connections, `EvictExtraOutboundPeers()` checks whether the node has too many outbound-full-relay peers.
+
+If so, it disconnects one, choosing the  peer that announced less recently a new block. If there are peers with the same announcement time (`CNodeState::m_last_block_announcement`), the one with higher node id (CNode::id) will be selected.
+[[summary]]
+=== Summary
+
+The node has two mechanisms to evict outbound peer stopped serving blocks for the node.
+
+The first one is to disconnect from bad outbound peers with bad headers chains in IBD.
+
+The second mechanism is to connect to new peers and evict ones if the node detects an potential stale tip event.
