@@ -1,11 +1,11 @@
 [[evicting_outgoing_connection]]
 == Evicting An Outgoing Connection
 
-Until https://github.com/bitcoin/bitcoin/pull/11490[PR #11490], there was no rotation of outbound peers. If an outbound peer stopped serving blocks for the node or was on a consensus-incompatible chain with less work than the tip of the node (but otherwise valid headers), then the node would never disconnect that peer, even though that peer was using one of our 8 outbound connection slots.
+Until https://github.com/bitcoin/bitcoin/pull/11490[PR #11490], there was no rotation of outbound peers. If an outbound peer stopped serving blocks for the node or was on a consensus-incompatible chain with less work than the tip of the node (but otherwise valid headers), then the node would never disconnect that peer, even though that peer was using one of the 8 outbound connection slots.
 
 Because the node relies on the outbound peers to find an honest node to reach consensus, allowing an incompatible peer to occupy one of those slots is undesirable, particularly if it is possible for all such slots to be occupied by such peers. 
 
-The PR introduced a protection against this by always checking to see if a peer's best-known block has less work than our tip, and if so, set a 20-minute timeout. If the peer is still not known to have caught up to a chain with as much work as the node after 20 minutes, then send a single `GETHEADERS` message, wait 2 more minutes, and if a better header has not been received by then, disconnect that peer.
+The PR introduced a protection against this by always checking to see if a peer's best-known block has less work than the node's tip, and if so, set a 20-minute timeout. If the peer is still not known to have caught up to a chain with as much work as the node after 20 minutes, then send a single `GETHEADERS` message, wait 2 more minutes, and if a better header has not been received by then, disconnect that peer.
 
 This change does not require the peer to synchronize with the same tip as the node, just an equal or greater work tip. (Doing otherwise would risk partitioning the network in the event of a chain split and is also unnecessary).
 
@@ -110,7 +110,7 @@ Note that this logic does not require the peers to be on the same chain as the n
 [[connecting_new_peer]]
 === Connecting to a new outbound peer if the node's tip is stale
 
-The https://github.com/bitcoin/bitcoin/pull/11560[PR #11560] implements a new eviction logic. The node connects to an additional outbound peer when detects the tip looks stale. Periodically, it is checked if the node has more outbound peers than allowed. If so, disconnect the one that least recently announced a new block. It is designed to mitigate P2P disruption if all our outbound peers stop relaying blocks to us.
+The https://github.com/bitcoin/bitcoin/pull/11560[PR #11560] implements a new eviction logic. The node connects to an additional outbound peer when detects the tip looks stale. Periodically, it is checked if the node has more outbound peers than allowed. If so, disconnect the one that least recently announced a new block. It is designed to mitigate P2P disruption if all the outbound peers stop relaying blocks to us.
 
 This logic is implemented by the `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4087[PeerManagerImpl::CheckForStaleTipAndEvictPeers()]` and it is https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L1298[called every 45 second], as defined in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L60[EXTRA_PEER_CHECK_INTERVAL]`.
 

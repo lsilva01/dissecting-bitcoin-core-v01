@@ -172,6 +172,135 @@ However, increasing the table sizes actually makes the EREBUS attack much easier
 This is a case of conflicting requirements, where the tradeoff between both has to be well evaluated.
 ===============================
 
+=== Current Implementation
+
+There are some classes that handle the network connection to other peers: `CNetAddr`, `CService`, `CAddress`, `CAddrInfo` and `CAddrMan`. This is not an exhaustive list, but these are the relevant ones in this context.
+
+==== `CNetAddr`
+
+`CNetAddr` is the network address itself. Two important fields in this class is the `m_addr` and `m_net`. +
+`m_addr` is the raw representation of the network address, in network byte order (big endian) for IPv4 and IPv6.
+`m_net` represents the network to which this address belongs. The networks supported by Bitcoin Core is defined in BIP 155 and in the `Network` enum.
+
+The `CNetAddr::ToStringIP()` method returns a human readable IP address. It also returns `Tor` or `I2P` address, if the peer is connected on these networks.
+
+[source,c++]  
+----
+enum Network
+{
+    NET_UNROUTABLE = 0,
+    NET_IPV4,
+    NET_IPV6,
+    NET_ONION,
+    NET_I2P,
+    NET_CJDNS,
+    NET_INTERNAL,
+    NET_MAX,
+};
+
+class CNetAddr
+{
+    protected:
+        prevector<ADDR_IPV6_SIZE, uint8_t> m_addr{ADDR_IPV6_SIZE, 0x0};
+        Network m_net{NET_IPV6};
+        // ...
+}
+----
+
+==== `CService`
+
+`CService` is the combination of a network address (`CNetAddr`) and a (TCP) port. It inherits all members from `CNetAddr ` and adds an `uint16_t port` field.
+
+The `ToStringIPPort()` method is used to return the IP and the port of the peer. This is used to set the `CNode::addrName` and to describe the peer to the user in `getpeerinfo`, `-netinfo` commands and in the Peer Table GUI (`peertablemodel.cpp`).
+
+[source,c++]  
+----
+class CService : public CNetAddr
+{
+    protected:
+        uint16_t port;
+    public:
+        CService();
+        CService(const CNetAddr& ip, uint16_t port);
+        // ...
+        uint16_t GetPort() const;
+        // ...
+        std::string ToStringPort() const;
+        std::string ToStringIPPort() const;
+        // ...   
+}
+----
+
+These two classes `CNetAddr` and `CService` were created in the https://github.com/bitcoin/bitcoin/pull/735[PR #735] to refactor class `CAddress`. 
+
+==== `CAddress`
+
+`CAddress` is a class derived from `CService`. It adds two information about the peer: the `uint32_t nTime` and `ServiceFlags nServices`.
+
+`nTime` represents the last time the peer was seen online. The default value is `TIME_INIT` (100000000). This value is updated every time the address is added to AddrMan (from `ADDR` messages, DNS or fixed seeds).
+
+If the `nTime` of an address in the `ADDR` message less than or equal to `TIME_INIT` or 10 minutes greater than the current time, the `nTime` of this address will be 5 days before the current time. Otherwise, it will be the time informed in `ADDR` message.
+
+If the address is retrieved from fixed seeds, its `nTime` receives a random time between one and two weeks ago. If it is from DNS Seeds, random time is between 3 and 7 days old.
+
+When manually adding or disconnecting a peer, `nTime` receives the current time.
+
+`nServices` represents the services provided by the peer. Typically, the node prefers peers that are able to serve the complete blockchain, blocks and transactions including witness data. The service flags are defined in the `ServiceFlags` enum.
+
+[source,c++]  
+----
+class CAddress : public CService
+{
+    static constexpr uint32_t TIME_INIT{100000000};
+
+public:
+    CAddress() : CService{} {};
+    CAddress(CService ipIn, ServiceFlags nServicesIn) : CService{ipIn}, nServices{nServicesIn} {};
+    //...
+    uint32_t nTime{TIME_INIT};
+
+    ServiceFlags nServices{NODE_NONE};
+};
+----
+
+==== `CAddrInfo`
+
+`CAddrInfo` stores statistics about a `CAddress`, such as the last successful connection, new connection attempts since last successful attempt, reference count in `new` table, if the address is in `tried` or `new` table and so others.
+
+This class is used in AddrMan's `mapInfo` which maps the address ids with their statistics. The information stored in this class is important for many decisions about address management.
+
+The `GetTriedBucket()`, `GetNewBucket()`, `GetBucketPosition()` and  `IsTerrible()` methods are crucial for the correct functioning of the AddrMan.
+
+This class also has the `CNetAddr source` field, which indicates the first peer that anounced this address.
+
+[source,c++]  
+----
+class CAddrInfo : public CAddress
+{
+    // ...
+private:
+    CNetAddr source;
+    int64_t nLastSuccess{0};
+    int nAttempts{0};
+    int nRefCount{0};
+    bool fInTried{false};
+    friend class CAddrMan;
+public:
+    // ...
+    int GetTriedBucket(const uint256 &nKey, const std::vector<bool> &asmap) const;
+    int GetNewBucket(const uint256 &nKey, const CNetAddr& src, const std::vector<bool> &asmap) const;
+    // ...
+    int GetBucketPosition(const uint256 &nKey, bool fNew, int nBucket) const;
+    bool IsTerrible(int64_t nNow = GetAdjustedTime()) const;
+}
+----
+
+==== CAddrMan
+
+.Network Classes
+image::images/chapter_2_1/network_classes.svg[]
+[NetworkClasses, align="center"]
+
 [[references]]
 === References
 
