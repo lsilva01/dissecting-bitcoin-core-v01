@@ -295,11 +295,77 @@ public:
 }
 ----
 
-==== CAddrMan
+=== `CAddrMan`
+
+`CAddrMan` is the address manager. It handles adding new address, resolving collisions, moving address between tables, persisting and storing the `new` and `tried` tables and much more.
+
+`CAddrMan` has some field that support the address management logic. 
+
+`nIdCount` is used to generate ids for new incoming addresses. Its inital value is 0 and it is incremented is incremented whenever a new address is added to AddrMan. The address ids are stored in the `new` and `tried` tables.
+
+[source,c++]  
+----
+// src/addrman.cpp
+CAddrInfo* CAddrMan::Create(const CAddress& addr, const CNetAddr& addrSource, int* pnId)
+{
+    int nId = nIdCount++;
+    mapInfo[nId] = CAddrInfo(addr, addrSource);
+    mapAddr[addr] = nId;
+    mapInfo[nId].nRandomPos = vRandom.size();
+    vRandom.push_back(nId);
+    if (pnId)
+        *pnId = nId;
+    return &mapInfo[nId];
+}
+----
+
+The code snippet above shows other important fields. `mapInfo` maps the newly created id and the `CAddrInfo`, which represents the adress with statistical information about it and its source (the peer that announced it). 
+
+As mentioned earlier, the `new` and `tried` tables only store the address ids. Any logic that uses the tables and needs more information about the peers, it retrieves from `mapInfo`, looking for the id. 
+
+`mapAddr` maps the network address (`CNetAddr`) and the id, and allows retrieving the id from a given address. This map  adds new address only in the method shown above and removes them in the `CAddrMan::Delete(int nId)`. 
+
+`mapAddr` is used only in the `CAddrMan::Find(...)` method, which finds a `CAddrInfo` given a `CNetAddr` object. As mentioned before, `CNetAddr` is the raw network address (IP without port) and `CAddrInfo` is the complete representation of the address, with IP, port, services and statistics.
+
+This field is necessary because the inputs AddrMan receives are usually a `CAddress` or `CService` object, since `CAddrInfo` is used only internally in `CAddrMan`.
+
+The other fields seen in the code above are `CAddrInfo::nRandomPos` and `CAddrMan::vRandom`. These two fields are used only in `CAddrMan::SwapRandom` and `CAddrMan::_GetAddr(...)` (which is called in response to `GETADDR` message) and their purpose is to randomize the addresses postion in order to to make it more difficult for an observer to infer the order in which the addresses got known.
+
+Tables are represented by the `vvTried` and `vvNew` fields. Both are two-dimensional array (array) where rows represent the total number of buckets for each table and columns represent the maximum allowed number of entries in each bucket.
+
+As seen in the <<eclipse_c6>>, the more buckets have been added since the original implementation. Currently, the total number of buckets for `new` table is defined by `ADDRMAN_NEW_BUCKET_COUNT` (1024) and for the `tried` by `ADDRMAN_TRIED_BUCKET_COUNT` (256). The maximum allowed number of entries in each bucket for both table is defined by `ADDRMAN_BUCKET_SIZE` (64).
+
+The code below shows these fields and the diagram shows the network classes mentioned so far.
+
+[source,c++]  
+----
+class CAddrMan
+{
+    // ...
+    int nIdCount GUARDED_BY(cs);
+    std::map<int, CAddrInfo> mapInfo GUARDED_BY(cs);
+    std::map<CNetAddr, int> mapAddr GUARDED_BY(cs);
+    std::vector<int> vRandom GUARDED_BY(cs);
+    int nTried GUARDED_BY(cs);
+    int vvTried[ADDRMAN_TRIED_BUCKET_COUNT][ADDRMAN_BUCKET_SIZE] GUARDED_BY(cs);
+    int nNew GUARDED_BY(cs);
+    int vvNew[ADDRMAN_NEW_BUCKET_COUNT][ADDRMAN_BUCKET_SIZE] GUARDED_BY(cs);
+    // ...
+}
+----
 
 .Network Classes
 image::images/chapter_2_1/network_classes.svg[]
 [NetworkClasses, align="center"]
+
+=== Adding New Address
+
+New adresses are added to AddrMan when:
+
+. an address is added manually
+. multiple address are received via `ADDR` or `ADDRv2` messages
+. fixed seeds are loaded
+. multiple address are received from DNS Seeds
 
 [[references]]
 === References
