@@ -1,6 +1,10 @@
 [[addrman]]
 == AddrMan
 
+The Bitcoin peer-to-peer layer supports messages that allow nodes to gossip the addresses of other nodes on the network. This allows new nodes coming online to learn of other peers, and new listening nodes (that are able to take incoming connections) can have their address gossiped so that other nodes can connect to them later.
+
+Bitcoin Core tracks and stores addresses using a component known as address manager or AddrMan, implemented in the class `CAddrMan`, introduced in the https://github.com/bitcoin/bitcoin/pull/787[PR #787]. AddrMan maintains known addresses (e.g. IP, I2P and onion) of bitcoin peers on the network. While the implementation has undergone several changes, namely increasing the number of buckets for each table, the essential design remains the same.
+
 The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
@@ -89,7 +93,7 @@ The https://github.com/bitcoin/bitcoin/pull/17428[PR #17428] implements this cou
 The https://github.com/bitcoin/bitcoin/issues/17326[issue #17326] has some interesting discussion about this countermeasure implementation.
 
 [[undeployed_eclipse]]
-=== Undeployed (or partially deployed) recommended countermeasures
+=== Undeployed (or partially deployed) countermeasures
 
 [[eclipse_c7]]
 === Countermeasure 7: More outgoing connections
@@ -274,7 +278,7 @@ public:
 
 `CAddrInfo` stores statistics about a `CAddress`, such as the last successful connection, new connection attempts since last successful attempt, reference count in `new` table, if the address is in `tried` or `new` table and so others.
 
-This class is used in AddrMan's `mapInfo` which maps the address ids with their statistics. The information stored in this class is important for many decisions about address management.
+This class is used in AddrMan's `mapInfo` which maps the address ids with their statistics (`CAddrInfo`). The information stored in this class is important for many decisions about address management.
 
 The `GetTriedBucket()`, `GetNewBucket()`, `GetBucketPosition()` and  `IsTerrible()` methods are crucial for the correct functioning of the AddrMan.
 
@@ -653,8 +657,49 @@ CAddrInfo CAddrMan::SelectTriedCollision_()
 
 Every https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L54[2 minutes], if there is no conflicting address, `addrman.Select(true)` is called to initiate a feller connection to an address stored in the `new` table. This implements the <<eclipse_c4>>.
 
+[[responding_getaddr_messages]]
+=== Responding to `GETADDR` Messages
 
+The `GETADDR` message requests an `ADDR` or `ADDRv2` message from the receiving node.
+The node responds to this message by calling `CAddrMan::GetAddr_()` to build the `vector<CAddress>` to be sent to the requesting peer.
 
+Before that, however, if the peer does not have `addr` permission, the addresses will be retrieved from a cache that stores the responses to GETADDR daily, so that an attacker gets the same 1,000 records per day (at most) and cannot track changes over real time. This was implemented in the https://github.com/bitcoin/bitcoin/pull/18991[PR #18991].
+
+`CAddrMan::GetAddr_()` is straighfoward. It randomly swaps the order of stored `CAddrInfo` objcts, therefore an observer cannot infer the order in which the addresses were known. The swap is done by `CAddrMan::SwapRandom()`.
+
+Next, it checks if the address is terrible (`CAddrInfo::IsTerrible`). All the criteria that make an address terrrible were mentioned in <<adding_new_address>> section.
+
+[source,c++]  
+----
+void CAddrMan::GetAddr_(std::vector<CAddress>& vAddr, size_t max_addresses, size_t max_pct)
+{
+    size_t nNodes = vRandom.size();
+    // ....
+    for (unsigned int n = 0; n < vRandom.size(); n++) {
+        if (vAddr.size() >= nNodes)
+            break;
+
+        int nRndPos = insecure_rand.randrange(vRandom.size() - n) + n;
+        SwapRandom(n, nRndPos);
+        assert(mapInfo.count(vRandom[n]) == 1);
+
+        const CAddrInfo& ai = mapInfo[vRandom[n]];
+        if (!ai.IsTerrible())
+            vAddr.push_back(ai);
+    }
+}
+----
+
+[[summary]]
+=== Summary
+
+Bitcoin Core tracks and stores addresses using a component known as address manager or AddrMan, implemented in the class `CAddrMan`.
+
+AddrMan has changed several times since its original implementation as result of the countermeasures suggested by _Eclipse Attack_ and _Erebus Attack_ papers and due to some other minor PRs to increase the privacy and prevent topology leaks.
+
+The main fields of Addrman are the `new` and `tried` tables and the `mapInfo`. The `new` table stores addresses for peers to whom the node has not yet initiated a connection.  The `tried` table table stores the addresses for peers to whom the node has successfully established connection. And `mapInfo` stores the id and other informations of all addresses that AddrMan has seen.
+
+The main processes that call AddrMan are: adding a new addresses from a `ADDR` message, selecting an address to connect to, testing an entry in `tried` table before evicting it or testing random address in `new` table to move it to `tried` and responding a `GETADDR` message.
 
 
 [[references]]
@@ -667,3 +712,5 @@ Every https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200
 * https://core.ac.uk/download/pdf/288502346.pdf[Characterization of the topology of theBitcoin network]
 
 * https://cs-people.bu.edu/heilman/eclipse[Eclipse Attacks on Bitcoin’s Peer-to-Peer Network]
+
+* https://developer.bitcoin.org/reference/p2p_networking.html[P2P Network]
