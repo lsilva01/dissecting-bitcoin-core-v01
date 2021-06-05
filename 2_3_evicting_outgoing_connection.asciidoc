@@ -17,6 +17,8 @@ The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e
  cd bitcoin
  git checkout -b text_branch 6d1d33d33491
 
+// TODO: check caa21f586f951d626a67f391050c3644f1057f57
+
 [[disconnecting_headers_chains_ibd]]
 === Disconnecting from bad outbound peers with bad headers chains in IBD 
 

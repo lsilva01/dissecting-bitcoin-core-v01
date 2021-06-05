@@ -1,0 +1,148 @@
+[[addrman]]
+== ConnMan
+
+`CConnman` class was created in the https://github.com/bitcoin/bitcoin/pull/8085[PR #8085] to to encapsulate P2P connections. Today, this class manages network layer logic.
+
+It creates sockets for listening for incoming connections and binds them to addresses and ports. It loads the `peer.dat` file to connect to addresses previously seen or already connected to. It also loads the `anchors.dat` to establish block-only connections. It starts the network threads. It handles the interruption of the network and the node shutdown.
+
+This text describes the Network Layer and and how Connman works.
+
+The commit https://github.com/bitcoin/bitcoin/commit/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[c7dd9ff71b] can be used as a reference to the https://github.com/bitcoin/bitcoin/tree/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[project's codebase] at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch c7dd9ff71b
+                             
+=== Starting The Node
+
+The `CConnman` and all the network processes are started in `AppInitMain(...)`, which is basically the main function of the application. When the node shuts down, connections are securely closed by `CConnman`.
+
+[source,c++]  
+----
+bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
+{
+    // ...
+    assert(!node.connman);
+    node.connman = std::make_unique<CConnman>(GetRand(std::numeric_limits<uint64_t>::max()), GetRand(std::numeric_limits<uint64_t>::max()), *node.addrman, args.GetBoolArg("-networkactive", true));
+    // ...
+    if (!node.connman->Start(*node.scheduler, connOptions)) {
+        return false;
+    }
+    // ...
+}
+
+void Interrupt(NodeContext& node)
+{
+    // ...
+    if (node.connman)
+        node.connman->Interrupt();
+    // ...
+}
+
+void Shutdown(NodeContext& node)
+{
+    // ...
+    if (node.connman) node.connman->Stop();
+    // ...
+    node.connman.reset();
+    // ...
+}
+----
+
+The `node` variable refers to the `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h#L39[struct NodeContext]`. It is a struct that contains references to chain state and connection state. This is used by the init function, RPC, GUI and test code to pass object references around without needing to declare the same variables and parameters repeatedly, or to use globals. The struct is defined in `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h[src/node/context.h]`.
+
+Before this struct was created, the global variable `g_conman` was used to manage the connection. But using global variables reduces the modularity and flexibility of the program, so the https://github.com/bitcoin/bitcoin/pull/16839[PR #16839] has gotten rid of the some global variables and has made `g_conman` a NodeContext member (now called `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h#L43[connman]`).
+
+=== Starting The Connections
+
+`CConnman::Start()` initiates all the network process and keeps them running. The first step is creating sockets for listening for incoming connections. By default, the sockets will be binded to 0.0.0.0:8333 (IPv4), [::]:8333 (IPv6) and 127.0.0.1:8334 (as a proxy for onion network). However, the user can define an different address passing it through the `-bind` or `-whitebind` argument when stating the node. This is done by `CConnman::InitBinds()`.
+
+.Difference between `-bind` and `-whitebind`
+[NOTE]
+===============================
+`-whitebind` option which works like `-bind`, except peers connecting to it are whitelisted (allowing a separate listen port for trusted connections). It was implemented in the https://github.com/bitcoin/bitcoin/pull/4378[PR #4378].
+===============================
+
+// Bind code
+[source,c++]  
+----
+bool CConnman::Start(CScheduler& scheduler, const Options& connOptions)
+{
+    Init(connOptions);
+
+    if (fListen && !InitBinds(connOptions.vBinds, connOptions.vWhiteBinds, connOptions.onion_binds)) {
+        if (clientInterface) {
+            clientInterface->ThreadSafeMessageBox(
+                _("Failed to listen on any port. Use -listen=0 if you want this."),
+                "", CClientUIInterface::MSG_ERROR);
+        }
+        return false;
+    }
+    // ...
+}
+----
+
+[source,c++]  
+----
+bool CConnman::InitBinds(...)
+{
+    // ...
+    for (const auto& addrBind : binds) {
+        fBound |= Bind(addrBind, (BF_EXPLICIT | BF_REPORT_ERROR), NetPermissionFlags::None);
+    }
+    for (const auto& addrBind : whiteBinds) {
+        fBound |= Bind(addrBind.m_service, (BF_EXPLICIT | BF_REPORT_ERROR), addrBind.m_flags);
+    }
+    if (binds.empty() && whiteBinds.empty()) {
+        struct in_addr inaddr_any;
+        inaddr_any.s_addr = htonl(INADDR_ANY);
+        struct in6_addr inaddr6_any = IN6ADDR_ANY_INIT;
+        fBound |= Bind(CService(inaddr6_any, GetListenPort()), BF_NONE, NetPermissionFlags::None);
+        fBound |= Bind(CService(inaddr_any, GetListenPort()), !fBound ? BF_REPORT_ERROR : BF_NONE, NetPermissionFlags::None);
+    }
+    // ...
+}
+----
+
+Next, if the user also has specified `-seednode`, an `ADDR_FETCH` connection is created for each seed to retrieve the addresses. +
+`CConnman::AddAddrFetch()` adds the seed to `m_addr_fetches` vector. The method `CConnman::ProcessAddrFetch()` gets the first address of the vector and create the `ADDR_FETCH` connection using `CConnman::OpenNetworkConnection(...)`.
+
+`CConnman::ProcessAddrFetch()` is called uninterruptedly in the `CConnman::ThreadOpenConnections()` thread. The method only stops working when `interruptNet` is triggered, which happens when the node is shut down.
+
+`ProcessAddrFetch()` is also once called if the node is started with `connect=<ip>`. The reason is that seeds can also be inserted in  `m_addr_fetches` in `CConnman::ThreadDNSAddressSeed()` if the node is behind a proxy or if the seeder does not support service bit filtering over DNS.
+
+Then, the `CConnman` loads addresses from `peers.dat`. This is done by by `CAddrDB::Read(CAddrMan& addr)`, which deserializes the contents of the file and allocates them to `CAddrMan& addr`. The sole purpose of `CAddrDB` is to write and read the (IP) address database (`peers.dat`).
+
+[source,c++]  
+----
+// src/net.cpp
+bool CConnman::Start(...)
+{
+    // ...
+    CAddrDB adb;
+    if (adb.Read(addrman))
+        LogPrintf("Loaded %i addresses from peers.dat  %dms\n", addrman.size(), GetTimeMillis() - nStart);
+    else {
+        addrman.Clear(); // Addrman can be in an inconsistent state after failure, reset it
+        LogPrintf("Recreating peers.dat\n");
+        DumpAddresses();
+    }
+    // ...
+}
+
+// src/addrdb.cpp
+CAddrDB::CAddrDB()
+{
+    pathAddr = gArgs.GetDataDirNet() / "peers.dat";
+}
+
+bool CAddrDB::Write(const CAddrMan& addr)
+{
+    return SerializeFileDB("peers", pathAddr, addr);
+}
+
+bool CAddrDB::Read(CAddrMan& addr)
+{
+    return DeserializeFileDB(pathAddr, addr);
+}
+----
