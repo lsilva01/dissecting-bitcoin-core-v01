@@ -146,3 +146,75 @@ bool CAddrDB::Read(CAddrMan& addr)
     return DeserializeFileDB(pathAddr, addr);
 }
 ----
+
+Note that `CConnman::addrman` is a reference to `NodeContext::addrman`. Both are the same object. There is only one `CConnman` and one`CAddrman` in the entire application, defined in `NodeContext`.
+
+The next step is loading addresses from `anchors.dat`, which stores the addresses of block-relay connections that have already been made. This is done by `ReadAnchors()` 
+
+`CConnman::m_use_addrman_outgoing` indicates whether the node wants to initiate outbound connections. It will be false only if `-connect` argument is set when starting the node.
+
+[source,c++]  
+----
+// src/net.cpp
+bool CConnman::Start(...)
+{
+    // ...
+    if (m_use_addrman_outgoing) {
+        // Load addresses from anchors.dat
+        m_anchors = ReadAnchors(gArgs.GetDataDirNet() / ANCHORS_DATABASE_FILENAME);
+        if (m_anchors.size() > MAX_BLOCK_RELAY_ONLY_ANCHORS) {
+            m_anchors.resize(MAX_BLOCK_RELAY_ONLY_ANCHORS);
+        }
+        LogPrintf("%i block-relay-only anchors will be tried for connections.\n", m_anchors.size());
+    }
+    // ...
+}
+----
+
+Then, semaphores are initialized for limiting connections. `semOutbound` is used to control outgoing connections and `semAddnode` to manual connections. `CSemaphore` constructor takes a counter as parameter, which is the maximum number of connections allowed. The counter is initialized in the constructor. Acquiring the semaphore decreases the counter, and releasing the semaphore increases the counter. This was implemented in the https://github.com/bitcoin/bitcoin/pull/1260[PR #1260].
+
+// max conn
+
+There are three flags to control the network activities:
+
+. `InterruptSocks5` interrupts reading bytes from a proxy. The user can specify a proxy for all outgoing network traffic with `-proxy` argument.
+
+. `interruptNet` signals when network activity should cease. This object is an instance of `CThreadInterrupt`, a helper class for interruptible sleeps. It overloads the () operator, which sets the `flag` field is set to true. In various network threads, there is an infinite loop controlled by this variable. When its value is true, the thread stops. `CThreadInterrupt::reset()` sets it to false again.
+
+. `flagInterruptMsgProc` is a boolean field and it is set to `true` when the node is interrupted. It is only used in `CConnman::ThreadMessageHandler` thread to stop receiving new messages.
+
+These flags were implemented in the https://github.com/bitcoin/bitcoin/pull/9289[PR #9289]. The objective was to allow asynchronous network handling. It was necessary to have more control over the shutdown process in order to deal with asynchronous connecting and sending/receiving data.
+
+There are 3 flags (and not just one) because the things need to be done in sequence. Message processing needs to be terminated before forcing all networking down, otherwise there is the risk of trying to process a node's messages during its destruction. This behavior can be seen in  `CConnman::Interrupt()`.
+
+[source,c++]  
+----
+void CConnman::Interrupt()
+{
+    {
+        LOCK(mutexMsgProc);
+        flagInterruptMsgProc = true;
+    }
+    condMsgProc.notify_all();
+
+    interruptNet();
+    InterruptSocks5(true);
+
+    if (semOutbound) {
+        for (int i=0; i<m_max_outbound; i++) {
+            semOutbound->post();
+        }
+    }
+
+    if (semAddnode) {
+        for (int i=0; i<nMaxAddnode; i++) {
+            semAddnode->post();
+        }
+    }
+}
+----
+
+With the semaphores and flags defined, the next step is to  sequentially start all the network threads.
+
+
+
