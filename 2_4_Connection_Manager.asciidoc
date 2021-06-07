@@ -216,5 +216,121 @@ void CConnman::Interrupt()
 
 With the semaphores and flags defined, the next step is to  sequentially start all the network threads.
 
+=== ThreadSocketHandler
 
+The first thread started is the `ThreadSocketHandler`. The thread's main code is a loop that runs three functions continuously until interrupted by `interruptNet` flag.
 
+[source,c++]  
+----
+void CConnman::ThreadSocketHandler()
+{
+    while (!interruptNet)
+    {
+        DisconnectNodes();
+        NotifyNumConnectionsChanged();
+        SocketHandler();
+    }
+}
+----
+
+`CConnman::DisconnectNodes()` first checks if the network is active via the `fNetworkActive` property, which is `true` by default and can be changed by the RPC command `setnetworkactive`, which disables/enables all P2P network activity. If enabled, all connected nodes will have the `CNode::fDisconnect` field changed to true.
+
+`CNode::fDisconnect` is particularly important field. It is used in various parts of the application to disconnect any node that does not comply with the consensus rules.
+
+[source,c++]  
+----
+void CConnman::DisconnectNodes()
+{
+    {
+        LOCK(cs_vNodes);
+
+        if (!fNetworkActive) {
+            // Disconnect any connected nodes
+            for (CNode* pnode : vNodes) {
+                if (!pnode->fDisconnect) {
+                    LogPrint(BCLog::NET, "Network not active, dropping peer=%d\n", pnode->GetId());
+                    pnode->fDisconnect = true;
+                }
+            }
+        }
+        // ...
+    }
+}
+----
+
+Note that before accessing `vNode`, there is a `LOCK(cs_vNodes)`. +
+`std::vector<CNode*> vNodes` is the vector that stores all connected nodes. Its access is protected by the recursive mutex `Note`. +
+The recursive_mutex class is a synchronization primitive that can be used to protect shared data from being simultaneously accessed by multiple threads.
+`LOCK(cs_vNodes)` locks the mutex. If another thread has already locked the mutex, a call to lock will block execution until the lock is acquired.
+
+Then the peers with `fDisconnect` field set to true will be disconnected. To do it, there are a few steps: The peer is removed from `vNodes` list, , it releases the outbound semaphore grant, closes the socket and the peer is kept in the disconnected pool (`std::list<CNode*> vNodesDisconnected`) until all references to it (`CNode::nRefCount`) are released.
+
+`CNode::CloseSocketDisconnect()` checks that `CNode::hSocket` is different from `INVALID_SOCKET` and if so, calls `close()` function of POSIX operating system API to close the socket.
+
+`INVALID_SOCKET` is defined as `(SOCKET)(~0)` in `src/compat.h`. It is the same way `WinSock2.h` defines this constant. The reason is that Bitcoin Core originally used `WinSock2.h` to manage socket, but in the commit https://github.com/bitcoin/bitcoin/commit/e874738d3de335faacb83d0398cabdff7477bfa0[e874738], this definition has been added so that the application no longer depends on Windows headers.
+
+`SOCKET` is just an alias for `unsigned int`, so `(SOCKET)(~0)` has the value `4294967295` (a.k.a. `UINT_MAX`). +
+`4294967295` and `-1` have the same binary representation of `0xFFFFFFFF` or 32 bits all set to `1`. +
+The POSIX function used to create socket is `accept()`. And, upon successful completion, it returns non-negative file descriptor (an integer) of the accepted socket. Otherwise, `-1`. +
+Therefore, the `(SOCKET) (~0)` has the same binary value that indicates an error in creating the socket.
+
+.POSIX (Portable Operating System Interface) 
+[NOTE]
+===============================
+POSIX (Portable Operating System Interface) is a set of standard operating system interfaces based on the Unix operating system. 
+The idea is that a program written to be based on POSIX standards can be easily ported across a large family of Unix derivatives (including, but not limited to, Linux and OSX).
+===============================
+
+[source,c++]  
+----
+void CConnman::DisconnectNodes()
+{
+    {
+        LOCK(cs_vNodes);
+        // ...
+        std::vector<CNode*> vNodesCopy = vNodes;
+        for (CNode* pnode : vNodesCopy)
+        {
+            if (pnode->fDisconnect)
+            {
+                // remove from vNodes
+                vNodes.erase(remove(vNodes.begin(), vNodes.end(), pnode), vNodes.end());
+
+                // release outbound grant (if any)
+                pnode->grantOutbound.Release();
+
+                // close socket and cleanup
+                pnode->CloseSocketDisconnect();
+
+                // hold in disconnected pool until all refs are released
+                pnode->Release();
+                vNodesDisconnected.push_back(pnode);
+            }
+        }
+    }
+    // ...
+}
+----
+
+There is a mechanism for assessing whether a CNode is still in use: the `CNode::nRefCount`. This field is incremented via `CNode::AddRef()` when the peer is created, during socket service and message handling. And `CNode::Release()` decreases it. When there are no more references to this `CNode`, it can be safely disconnected.
+
+When `CNode::nRefCount` is 0, the node can be deleted and removed from the disconnected pool `vNodesDisconnected`.
+
+[source,c++]  
+----
+void CConnman::DisconnectNodes()
+{
+    // ...
+    {
+        // ...
+        std::list<CNode*> vNodesDisconnectedCopy = vNodesDisconnected;
+        for (CNode* pnode : vNodesDisconnectedCopy)
+        {
+            if (pnode->GetRefCount() <= 0) {
+                vNodesDisconnected.remove(pnode);
+                DeleteNode(pnode);
+            }
+        }
+    }
+}
+----
