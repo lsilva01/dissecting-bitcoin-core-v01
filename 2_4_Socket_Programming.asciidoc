@@ -1,0 +1,294 @@
+== Socket Programming
+
+The network concept of a _Socket_ refers to the connection of one host to another through the combination of compatible IP address and ports. 
+
+The software concept of _Socket_ is a class hierarchy and draws its roots from Berkeley distribution of UNIX or BSD (Berkeley Software Distribution). Since sockets were designed for UNIX systems, they will work well and are relevant to all form of Linux.
+
+In addition, sockets have been implemented frequently with Windows _WinSock_ programming, though not necessarily all of  socket structures and TCP/IP/UDP code will function in Windows as they do in Linux.
+
+Sockets receive _endpoints_ of a connection and the attached connections between sockets that link two separate hosts are called _Threads_ (not the same thing as process _Threads_).
+
+Socket programming is generally _lower level_ programming meaning _higher level_ applications and graphical interfaces run over the top of its structures and objects.
+
+In Bitcoin Core, the socket logic is in the lowest level code region, the `net.{h,cpp}`. The next higher level, the `net_processing.{h,cpp}` region just handles the protocol message without any knowledge of the underlying network logic.
+
+There are certain rules that govern socket programming. For instance, there are different _address domains_ and _socket types_ that may be used in a connection. Two sockets must be the same _type_ and in the same _domain_ to enable communication between hosts.
+
+Two main types of socket domains are _Unix domain_ (a character string used where two Unix processes share a file system) and _Internet domain_ (internet address and port number).
+
+Let's break down the basic structure of an application using sockets and review the sequence of the events:
+
+=== SOCKADDR_IN
+
+The structure that contains the internet address is known as `sockaddr_in`. The definition of that structure is:
+
+[source,c++]  
+----
+struct sockaddr_in {
+    sa_family_t    sin_family;
+    in_port_t      sin_port;
+    struct in_addr sin_addr;
+    unsigned char  sin_zero[...];
+};
+
+/* Internet address */
+struct in_addr {
+    uint32_t       s_addr;     /* address in network byte order */
+};
+
+struct sockaddr_in6 {
+    sa_family_t     sin6_family;   /* AF_INET6 */
+    in_port_t       sin6_port;     /* port number */
+    uint32_t        sin6_flowinfo; /* IPv6 flow information */
+    struct in6_addr sin6_addr;     /* IPv6 address */
+    uint32_t        sin6_scope_id; /* Scope ID (new in 2.4) */
+};
+
+struct in6_addr {
+    unsigned char   s6_addr[16];   /* IPv6 address */
+};
+----
+
+The structure's data members are used as follows:
+
+`sin_family` specifies the address family, usually the constant `AF_INET` for IPv4 or `AF_INET6` for IPv6.
+
+`sin_port` specifies the port number and must be used with `htons()` function which converts the _host byte order_ to _network byte order_ so it can be retransmitted and routed propely when opening the socket connection. The reason for this is that computer and network protocol order their bytes in a non-compatible fashion, each opposite of the other.
+
+`sin_addr` holds the IP address return by `inet_addr()` to be used in the socket connection.
+
+`sin_zero` is used with a char array buffer, usually set to 0.
+
+=== Socket Functions
+
+=== htonl() and htons()
+
+Big-endianness is the dominant ordering in networking protocols, such as in the internet protocol suite, where it is referred to as network order, transmitting the most significant byte first. Conversely, little-endianness is the dominant ordering for processor architectures (x86, most ARM implementations, base RISC-V implementations) and their associated memory.
+
+The `htonl()` function converts an IPv4 address (unsigned integer) from host to TCP/IP network byte order (which is big-endian). It takes a 32-bit number in _host byte order_ and returns a 32-bit number in the _network byte order_ used in TCP/IP networks (the `AF_INET` or `AF_INET6` address family).
+
+[source,c++]  
+----
+uint32_t htonl(uint32_t hostlong);
+----
+
+The `htons()` function takes a 16-bit number in _host byte order_ and returns a 16-bit number in _network byte order_ used in TCP/IP networks (the AF_INET or AF_INET6 address family). It can be used to convert an IP port number in host byte order to the IP port number in network byte order.
+
+[source,c++]  
+----
+uint16_t htons(uint16_t hostshort);
+----
+
+=== inet_addr()
+
+The `inet_addr()` function converts a string containing an IPv4 dotted-decimal address into a proper address for the IN_ADDR structure. This function is not used in Bitcoin Core.
+
+[source,c++]  
+----
+in_addr_t inet_addr(const char *cp);
+----
+
+In Bitcoin Core, the function and structures presented above are used in `CService::GetSockAddr()` to obtain the IPv4/6 socket address from the `CService`, which is a combination of a network address (`CNetAddr`) and a (TCP) port.
+
+[source,c++]  
+----
+bool CService::GetSockAddr(struct sockaddr* paddr, socklen_t *addrlen) const
+{
+    if (IsIPv4()) {
+        if (*addrlen < (socklen_t)sizeof(struct sockaddr_in))
+            return false;
+        //...
+        if (!GetInAddr(&paddrin->sin_addr))
+            return false;
+        paddrin->sin_family = AF_INET;
+        paddrin->sin_port = htons(port);
+        return true;
+    }
+    if (IsIPv6()) {
+        // ...
+        paddrin6->sin6_family = AF_INET6;
+        paddrin6->sin6_port = htons(port);
+        return true;
+    }
+    return false;
+}
+----
+
+=== socket()
+
+The `socket()` function creates an unbound socket in a communications domain, and returns a file descriptor that can be used in later function calls that operate on sockets.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+int socket(int domain, int type, int protocol);
+----
+
+The `socket()` function takes the following arguments:
+
+`domain` specifies the communications domain in which a socket is to be created. In Bitcoin Core, `sockaddr::sa_family`, which was mentioned in the section about `sockaddr_in`,  will be used as an argument to `domain` (usually `AF_INET` or `AF_INET6`).
+
+`type` specifies the type of socket to be created. Bitcoin Core always use `SOCK_STREAM` in this argument, what means the socket type is Transmission Control Protocol (TCP). +
+Other common option is `SOCK_DGRAM` for UDP connections, but they are not used in Bitcoin Core.
+
+`protocol` specifies a particular protocol to be used with the socket. Specifying a protocol of 0 causes socket() to use an unspecified default protocol appropriate for the requested socket type. +
+Bitcoin Core uses `IPPROTO_TCP`, which is the expected value when the `domain` parameter is `AF_INET` or `AF_INET6` and the `type` parameter is `SOCK_STREAM`.
+
+[source,c++]  
+----
+std::unique_ptr<Sock> CreateSockTCP(const CService& address_family)
+{
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    if (!address_family.GetSockAddr((struct sockaddr*)&sockaddr, &len)) {
+        LogPrintf("Cannot create socket for %s: unsupported network\n", address_family.ToString());
+        return nullptr;
+    }
+
+    SOCKET hSocket = socket(((struct sockaddr*)&sockaddr)->sa_family, SOCK_STREAM, IPPROTO_TCP);
+    if (hSocket == INVALID_SOCKET) {
+        return nullptr;
+    }
+    // ...
+    return std::make_unique<Sock>(hSocket);
+}
+----
+
+Note that the POSIX function `socket()` returns non-negative integer, the socket file descriptor and it is atributed to `hSocket` variable, but the `CreateSockTCP(...)` return type is `std::unique_ptr<Sock>`.
+
+`Sock` class was introduced in https://github.com/bitcoin/bitcoin/pull/20788[PR #20788].  It manages the lifetime of a socket - when the object that contains the socket goes out of scope, the underlying socket will be closed.
+
+In addition, the new `Sock` class has a `Send()`, `Recv()` and `Wait()` methods that can be overridden by unit tests to mock the socket operations.
+
+=== WSAStartup()
+
+The `WSAStartup` function initiates use of the Winsock DLL by a process. It is used in Bitcoin Core within `#ifdef WIN32` directive in `src/util/system.cpp:SetupNetworking()` function.
+
+[source,c++]  
+----
+int WSAStartup( WORD wVersionRequired, LPWSADATA lpWSAData);
+----
+
+=== bind()
+
+The `bind()` function associates a socket with a `sockaddr_in` structure containing the IP address and port used to build the connection. 
+
+It is required on an unconnected socket before subsequent calls to the listen function. It is normally used to bind to either connection-oriented (stream) or connectionless (datagram) sockets.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+int bind(int socket, const struct sockaddr *address, socklen_t address_len);
+----
+
+The `bind()` function takes the following arguments:
+
+`socket` specifies the file descriptor of the socket to be bound. 
+
+`address` points to a sockaddr structure containing the address to be bound to the socket. The length and format of the address depend on the address family of the socket. 
+
+`address_len` specifies the length of the sockaddr structure pointed to by the address argument.
+
+In Bitcoin Core, `bind()` function is called in `CConnman::BindListenPort()` right after the socket creation.
+
+[source,c++]  
+----
+bool CConnman::BindListenPort(const CService& addrBind, ...)
+{
+    // ...
+    std::unique_ptr<Sock> sock = CreateSock(addrBind);
+    // ...
+    if (::bind(sock->Get(), (struct sockaddr*)&sockaddr, len) == SOCKET_ERROR)
+    {
+        int nErr = WSAGetLastError();
+        if (nErr == WSAEADDRINUSE)
+            strError = strprintf(_("Unable to bind to %s on this computer. %s is probably already running."), addrBind.ToString(), PACKAGE_NAME);
+        else
+            strError = strprintf(_("Unable to bind to %s on this computer (bind returned error %s)"), addrBind.ToString(), NetworkErrorString(nErr));
+        LogPrintf("%s\n", strError.original);
+        return false;
+    }
+    LogPrintf("Bound to %s\n", addrBind.ToString());
+    // ...
+}
+----
+
+=== listen()
+
+The `listen()` places a socket in a state in which it is listening for an incoming connection.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+int listen(int socket, int backlog);
+----
+
+It takes takes two arguments: 
+
+`socket` is the unconnected socket to listen on.
+
+`backlog` is the maximum number of connections. If set to SOMAXCONN, the underlying service provider responsible for socket s will set the backlog to a maximum reasonable value.
+
+In Bitcoin Core, `listen()` is called in `CConnman::BindListenPort()` right after the socket be bound.
+Note that at the end of the method, the socket is added to `vhListenSocket`, which tracks the listening sockets.
+
+[source,c++]  
+----
+bool CConnman::BindListenPort(const CService& addrBind, ...)
+{
+    // ...
+    if (listen(sock->Get(), SOMAXCONN) == SOCKET_ERROR)
+    {
+        strError = strprintf(_("Error: Listening for incoming connections failed (listen returned error %s)"), NetworkErrorString(WSAGetLastError()));
+        LogPrintf("%s\n", strError.original);
+        return false;
+    }
+
+    vhListenSocket.push_back(ListenSocket(sock->Release(), permissions));
+    return true;
+}
+----
+
+The `accept()` function permits an incoming connection attempt on a socket.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+int accept(int socket, struct sockaddr *restrict address,
+socklen_t *restrict address_len);
+----
+
+This function takes the following arguments:
+
+`socket` specifies a socket that was created with `socket()`, has been bound to an address with `bind()`, and has issued a successful call to `listen()`. 
+
+`address` is either a null pointer, or a pointer to a    `sockaddr` structure where the address of the connecting socket shall be returned. 
+
+`address_len` is an optional pointer to an integer that contains the length of structure pointed to by the addr parameter.
+
+Upon successful completion, accept() returns the non-negative file descriptor of the accepted socket. Otherwise, -1 will be returned.
+
+In Bitcoin Core, this function is called in `CConnman::AcceptConnection()`. It retrieves the listening sockets from the `vhListenSocket` list mentioned earlier.
+
+[source,c++]  
+----
+void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
+    struct sockaddr_storage sockaddr;
+    socklen_t len = sizeof(sockaddr);
+    SOCKET hSocket = accept(hListenSocket.socket, (struct sockaddr*)&sockaddr, &len);
+    // ...
+}
+----
+
+=== References
+
+https://www.die.net/[Die.net - Linux Man Page]
+
+https://docs.microsoft.com/en-us/windows/win32/api/winsock2/[Winsock2.h Header]
+
+
+
