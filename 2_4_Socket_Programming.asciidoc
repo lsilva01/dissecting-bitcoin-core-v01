@@ -18,7 +18,7 @@ Two main types of socket domains are _Unix domain_ (a character string used wher
 
 Let's break down the basic structure of an application using sockets and review the sequence of the events:
 
-=== SOCKADDR_IN
+=== `sockaddr_in`
 
 The structure that contains the internet address is known as `sockaddr_in`. The definition of that structure is:
 
@@ -28,7 +28,7 @@ struct sockaddr_in {
     sa_family_t    sin_family;
     in_port_t      sin_port;
     struct in_addr sin_addr;
-    unsigned char  sin_zero[...];
+    unsigned char  sin_zero[8];
 };
 
 /* Internet address */
@@ -59,9 +59,7 @@ The structure's data members are used as follows:
 
 `sin_zero` is used with a char array buffer, usually set to 0.
 
-=== Socket Functions
-
-=== htonl() and htons()
+=== `htonl()` and `htons()`
 
 Big-endianness is the dominant ordering in networking protocols, such as in the internet protocol suite, where it is referred to as network order, transmitting the most significant byte first. Conversely, little-endianness is the dominant ordering for processor architectures (x86, most ARM implementations, base RISC-V implementations) and their associated memory.
 
@@ -77,15 +75,6 @@ The `htons()` function takes a 16-bit number in _host byte order_ and returns a 
 [source,c++]  
 ----
 uint16_t htons(uint16_t hostshort);
-----
-
-=== inet_addr()
-
-The `inet_addr()` function converts a string containing an IPv4 dotted-decimal address into a proper address for the IN_ADDR structure. This function is not used in Bitcoin Core.
-
-[source,c++]  
-----
-in_addr_t inet_addr(const char *cp);
 ----
 
 In Bitcoin Core, the function and structures presented above are used in `CService::GetSockAddr()` to obtain the IPv4/6 socket address from the `CService`, which is a combination of a network address (`CNetAddr`) and a (TCP) port.
@@ -114,9 +103,13 @@ bool CService::GetSockAddr(struct sockaddr* paddr, socklen_t *addrlen) const
 }
 ----
 
-=== socket()
+=== `socket()`
 
 The `socket()` function creates an unbound socket in a communications domain, and returns a file descriptor that can be used in later function calls that operate on sockets.
+
+File descriptor (FD, less frequently _fildes_) is a unique identifier for a file or other input/output resource, such as a pipe or network socket.
+
+File descriptors are a part of the POSIX API and typically have non-negative integer values, with negative values being reserved to indicate "no value" or error conditions. 
 
 [source,c++]  
 ----
@@ -161,7 +154,7 @@ Note that the POSIX function `socket()` returns non-negative integer, the socket
 
 In addition, the new `Sock` class has a `Send()`, `Recv()` and `Wait()` methods that can be overridden by unit tests to mock the socket operations.
 
-=== WSAStartup()
+=== `WSAStartup()`
 
 The `WSAStartup` function initiates use of the Winsock DLL by a process. It is used in Bitcoin Core within `#ifdef WIN32` directive in `src/util/system.cpp:SetupNetworking()` function.
 
@@ -170,7 +163,7 @@ The `WSAStartup` function initiates use of the Winsock DLL by a process. It is u
 int WSAStartup( WORD wVersionRequired, LPWSADATA lpWSAData);
 ----
 
-=== bind()
+=== `bind()`
 
 The `bind()` function associates a socket with a `sockaddr_in` structure containing the IP address and port used to build the connection. 
 
@@ -215,7 +208,7 @@ bool CConnman::BindListenPort(const CService& addrBind, ...)
 }
 ----
 
-=== listen()
+=== `listen()`
 
 The `listen()` places a socket in a state in which it is listening for an incoming connection.
 
@@ -252,6 +245,8 @@ bool CConnman::BindListenPort(const CService& addrBind, ...)
 }
 ----
 
+=== `accept()`
+
 The `accept()` function permits an incoming connection attempt on a socket.
 
 [source,c++]  
@@ -284,9 +279,133 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
 }
 ----
 
+=== `select()`
+
+A fair number of socket calls, like `accept()` and `recv()`, are blocking. This is a problem for real-life network applications, where a socket server needs to handle a large number of clients. 
+
+It is easy to see that with large number of clients, the application would end up blocking most of the time and hence, would hardly scale. The way around this problem is to use the socket `select()` call, which allows us to monitor a large number of sockets, all in one shot without having to block individually for each socket.
+
+The `select()` function determines the status of one or more sockets, waiting if necessary, to perform synchronous I/O.
+
+This function gives instructions to the kernel to wait for any of the multiple events to occur (for example, data received from a peer) and awakens the process only after one or more events occur or a specified time passes.
+
+[source,c++]  
+----
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
+
+struct timeval {
+    long int tv_sec;
+    long int tv_usec
+};
+----
+
+The select() call takes several arguments:
+
+`nfds` is the highest file descriptor plus one. Thus, if two file descriptors with values 2 and 10 should be selected, then the nfds parameter should be 10 + 1 or 11 and not 2. The maximum number of sockets supported by select() has an upper limit, represented by `FD_SETSIZE` (typically `1024`). For simpler programs, passing `FD_SETSIZE` as nfds should be more than sufficient.
+
+The next three parameters represent the three different types of events monitored by the `select()`: read, write, and exception events.
+
+`readfds` is an optional pointer to a set of sockets to be checked for readability.
+
+`writefds` is an optional pointer to a set of sockets to be checked for writability.
+
+`exceptfds` is an optional pointer to a set of sockets to be checked for errors.
+
+The sixth and the last argument to `select()` is a timeout value in the form of a pointer to a `timeval` structure.
+
+`tv_sec` stores the number of whole seconds of elapsed time.
+
+`tv_usec` stores the rest of the elapsed time (a fraction of a second) in the form of microseconds. 
+
+If `timeout` argument is NULL, then the select() waits indefinitely for events.
+
+Bitcoin Core uses FD_SETSIZE to calculate the maximum number of connections (`nMaxConnections`). 
+
+[source,c++]  
+----
+bool AppInitParameterInteraction(const ArgsManager& args)
+{
+    // ...
+#ifdef USE_POLL
+    int fd_max = nFD;
+#else
+    int fd_max = FD_SETSIZE;
+#endif
+    nMaxConnections = std::max(std::min<int>(nMaxConnections, fd_max - nBind - MIN_CORE_FILEDESCRIPTORS - MAX_ADDNODE_CONNECTIONS - NUM_FDS_MESSAGE_CAPTURE), 0);
+    // ...
+}
+----
+
+Note that `FD_SETSIZE` only if the `USE_POLL` directive is true. This directive will be more detailed in the next section.
+
+The `select()` function is used in `CConnman::SocketEvents(...)` to select sockets to receive and send data asynchronously.
+
+[source,c++]  
+----
+#ifdef USE_POLL
+// ...
+#else
+void CConnman::SocketEvents(...)
+{
+    if (!GenerateSelectSet(recv_select_set, send_select_set, error_select_set)) {
+        interruptNet.sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MILLISECONDS));
+        return;
+    }
+    // ...
+    struct timeval timeout;
+    timeout.tv_sec  = 0;
+    timeout.tv_usec = SELECT_TIMEOUT_MILLISECONDS * 1000;
+
+    fd_set fdsetRecv;
+    // ...
+    FD_ZERO(&fdsetRecv);
+    // ...
+    SOCKET hSocketMax = 0;
+
+    for (SOCKET hSocket : recv_select_set) {
+        FD_SET(hSocket, &fdsetRecv);
+        hSocketMax = std::max(hSocketMax, hSocket);
+    }
+    // ...
+    int nSelect = select(hSocketMax + 1, &fdsetRecv, &fdsetSend, &fdsetError, &timeout);
+    // ...
+    for (SOCKET hSocket : recv_select_set) {
+        if (FD_ISSET(hSocket, &fdsetRecv)) {
+            recv_set.insert(hSocket);
+        }
+    }
+}
+----
+
+`GenerateSelectSet()` retrieves the sockets to that will be used as argument to select. As mentioned previously the first parameter of `select()` is the highest file descriptor plus one. `hSocketMax` tracks the highest value.
+
+The `fd_set` structure is used by sockets functions and service providers, such as the select function, to place sockets into a "set".
+
+`FD_ZERO(fdsetp)` initializes the descriptor set pointed to by `fdsetp` to the null set. No error is returned if the set is not empty at the time `FD_ZERO()` is invoked.
+
+`FD_SET(fd, fdsetp)` adds the file descriptor `fd` to the set pointed to by `fdsetp`. If the file descriptor `fd` is already in this set, it has no effect on the set.
+
+`FD_ISSET(fd, fdsetp)` evaluates to non-zero if the file descriptor `fd` is a member of the set pointed to by `fdsetp`, and evaluates to zero otherwise.
+
+The code snippet just shows the process for `std::set<SOCKET> &recv_set`. Note that the same steps are apply to `std::set<SOCKET> &send_set` and `std::set<SOCKET> &error_set`. This method not only selects the sockets to be monitored, but also divides them in three sets for better handling.
+
+=== `poll()`
+
+Until https://github.com/bitcoin/bitcoin/pull/14336[PR #14336], the only way to concurrently monitor multiple network connections (sockets) in Bitcoin Core was with the `select()` function, shown in the previous section.
+
+This PR introduced the use of `poll()` function and eliminated the restriction on maximum socket descriptor number, the `FD_SETSIZE` (typically `1024`).
+
+
+
+
+
 === References
 
 https://www.die.net/[Die.net - Linux Man Page]
+
+https://en.wikipedia.org/wiki/File_descriptor[File descriptor]
+
+http://codingbison.com/c/c-sockets-select.html[Socket Programming: Socket Select]
 
 https://docs.microsoft.com/en-us/windows/win32/api/winsock2/[Winsock2.h Header]
 
