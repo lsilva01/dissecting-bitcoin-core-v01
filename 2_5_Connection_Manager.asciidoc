@@ -7,7 +7,7 @@ It creates sockets for listening for incoming connections and binds them to addr
 
 This text describes the Network Layer and and how Connman works.
 
-The commit https://github.com/bitcoin/bitcoin/commit/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[c7dd9ff71b] can be used as a reference to the https://github.com/bitcoin/bitcoin/tree/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[project's codebase] at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[c7dd9ff71b] can be used as a reference for the https://github.com/bitcoin/bitcoin/tree/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[project's codebase] at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin

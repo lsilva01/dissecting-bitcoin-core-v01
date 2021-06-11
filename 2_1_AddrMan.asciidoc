@@ -5,7 +5,7 @@ The Bitcoin peer-to-peer layer supports messages that allow nodes to gossip the 
 
 Bitcoin Core tracks and stores addresses using a component known as address manager or AddrMan, implemented in the class `CAddrMan`, introduced in the https://github.com/bitcoin/bitcoin/pull/787[PR #787]. AddrMan maintains known addresses (e.g. IP, I2P and onion) of bitcoin peers on the network. While the implementation has undergone several changes, namely increasing the number of buckets for each table, the essential design remains the same.
 
-The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference for the project’s codebase at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin

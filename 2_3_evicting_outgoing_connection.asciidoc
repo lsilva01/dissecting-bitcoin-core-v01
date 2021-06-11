@@ -11,7 +11,7 @@ This change does not require the peer to synchronize with the same tip as the no
 
 The node picks 4 of the outbound peers and do not subject them to this logic, to be more conservative and to prevent temporary network issues (or an attacker) to excessively disrupt network topology.
 
-The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference for the project’s codebase at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin

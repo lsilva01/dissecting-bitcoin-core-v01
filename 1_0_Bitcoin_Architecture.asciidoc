@@ -5,7 +5,7 @@ This text provides an overview of Bitcoin Core Architecture, describes the main 
 
 It also answers common questions such as "How does the node find other peers on the network?", "How is a new block or transaction received and validated?" or "How is a transaction created and broadcasted?" along with others.
 
-The commit https://github.com/bitcoin/bitcoin/commit/4b5659c6b115315c9fd2902b4edd4b960a5e066e[4b5659c6b1] can be used as a reference to the https://github.com/bitcoin/bitcoin/tree/4b5659c6b115315c9fd2902b4edd4b960a5e066e[project's codebase] at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/4b5659c6b115315c9fd2902b4edd4b960a5e066e[4b5659c6b1] can be used as a reference for the https://github.com/bitcoin/bitcoin/tree/4b5659c6b115315c9fd2902b4edd4b960a5e066e[project's codebase] at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin

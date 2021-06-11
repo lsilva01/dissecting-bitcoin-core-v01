@@ -1,3 +1,4 @@
+[[socket_programming]]
 == Socket Programming
 
 The network concept of a _Socket_ refers to the connection of one host to another through the combination of compatible IP address and ports. 
@@ -16,8 +17,15 @@ There are certain rules that govern socket programming. For instance, there are 
 
 Two main types of socket domains are _Unix domain_ (a character string used where two Unix processes share a file system) and _Internet domain_ (internet address and port number).
 
-Let's break down the basic structure of an application using sockets and review the sequence of the events:
+This text breaks down the basic structure of an application using sockets and review the sequence of the events.
 
+The commit https://github.com/bitcoin/bitcoin/commit/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[c7dd9ff71b] can be used as a reference for the https://github.com/bitcoin/bitcoin/tree/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc[project's codebase] at the time of writing.
+
+ git clone https://github.com/bitcoin/bitcoin.git
+ cd bitcoin
+ git checkout -b text_branch c7dd9ff71b
+
+[[sockaddr_in]]
 === `sockaddr_in`
 
 The structure that contains the internet address is known as `sockaddr_in`. The definition of that structure is:
@@ -59,6 +67,7 @@ The structure's data members are used as follows:
 
 `sin_zero` is used with a char array buffer, usually set to 0.
 
+[[htonl_htons]]
 === `htonl()` and `htons()`
 
 Big-endianness is the dominant ordering in networking protocols, such as in the internet protocol suite, where it is referred to as network order, transmitting the most significant byte first. Conversely, little-endianness is the dominant ordering for processor architectures (x86, most ARM implementations, base RISC-V implementations) and their associated memory.
@@ -103,6 +112,7 @@ bool CService::GetSockAddr(struct sockaddr* paddr, socklen_t *addrlen) const
 }
 ----
 
+[[socket]]
 === `socket()`
 
 The `socket()` function creates an unbound socket in a communications domain, and returns a file descriptor that can be used in later function calls that operate on sockets.
@@ -154,6 +164,81 @@ Note that the POSIX function `socket()` returns non-negative integer, the socket
 
 In addition, the new `Sock` class has a `Send()`, `Recv()` and `Wait()` methods that can be overridden by unit tests to mock the socket operations.
 
+[[setsockopt]]
+=== `setsockopt()`
+
+The `setsockopt()` function provides an application program with the means to control socket behavior. An application program can use `setsockopt()` to allocate buffer space, control timeouts, or permit socket data broadcasts.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+int setsockopt(int socket, int level, int option_name,
+const void *option_value, socklen_t option_len);
+----
+
+The `level` argument specifies the protocol level at which the option resides. To set options at the socket level, specify the level argument as `SOL_SOCKET`. To set options at other levels, supply the appropriate level identifier for the protocol controlling the option. For example, to indicate that an option is interpreted by the TCP (Transport Control Protocol), set level to `IPPROTO_TCP`.
+
+The following table shows some levels that can be passed to `setsockopt()`.
+
+|===
+|Level | Description
+
+|`SOL_SOCKET`
+|Indicates that the options are protocol independent (socket layer).
+
+|`IPPROTO_TCP`
+|Indicates that the TCP protocol is to be used.
+
+|`IPPROTO_IPV6`
+|Indicates that the options apply to sockets created for the IPv6 address family (AF_INET6).
+
+|===
+
+The socket option for which the value is to be set (for example, SO_BROADCAST). The `optname` parameter must be a socket option defined within the specified level, or behavior is undefined.
+
+The following table shows some options that can be applied to sockets.
+
+|===
+|Option | Description
+
+|`IPV6_V6ONLY`
+|If this flag is set to true (nonzero), then the socket is restricted to sending and receiving IPv6 packets only.
+
+|`SO_REUSEADDR`
+|Indicates that the rules used in validating addresses supplied in a `bind()` call should allow reuse of local addresses.
+
+|`IPV6_PROTECTION_LEVEL`
+|Socket option enables developers to place access restrictions on IPv6 sockets. Such restrictions enable an application running on a private LAN to simply and robustly harden itself against external attacks.
+
+|`TCP_NODELAY`
+|Set the no-delay option (disable Nagle's algorithm) on the TCP socket.
+
+|===
+
+In Bitcoin Core, the options are set when creating or binding the socket.
+
+[source,c++]  
+----
+bool CConnman::BindListenPort(...)
+{
+    // ...
+    setsockopt(sock->Get(), SOL_SOCKET, SO_REUSEADDR, (sockopt_arg_type)&nOne, sizeof(int));
+    // ...
+    if (addrBind.IsIPv6()) {
+#ifdef IPV6_V6ONLY
+        setsockopt(sock->Get(), IPPROTO_IPV6, IPV6_V6ONLY, (sockopt_arg_type)&nOne, sizeof(int));
+#endif
+#ifdef WIN32
+        int nProtLevel = PROTECTION_LEVEL_UNRESTRICTED;
+        setsockopt(sock->Get(), IPPROTO_IPV6, IPV6_PROTECTION_LEVEL, (const char*)&nProtLevel, sizeof(int));
+#endif
+    }
+    //...
+}
+----
+
+[[wsatartup]]
 === `WSAStartup()`
 
 The `WSAStartup` function initiates use of the Winsock DLL by a process. It is used in Bitcoin Core within `#ifdef WIN32` directive in `src/util/system.cpp:SetupNetworking()` function.
@@ -163,6 +248,7 @@ The `WSAStartup` function initiates use of the Winsock DLL by a process. It is u
 int WSAStartup( WORD wVersionRequired, LPWSADATA lpWSAData);
 ----
 
+[[bind]]
 === `bind()`
 
 The `bind()` function associates a socket with a `sockaddr_in` structure containing the IP address and port used to build the connection. 
@@ -208,6 +294,7 @@ bool CConnman::BindListenPort(const CService& addrBind, ...)
 }
 ----
 
+[[listen]]
 === `listen()`
 
 The `listen()` places a socket in a state in which it is listening for an incoming connection.
@@ -245,6 +332,7 @@ bool CConnman::BindListenPort(const CService& addrBind, ...)
 }
 ----
 
+[[accept]]
 === `accept()`
 
 The `accept()` function permits an incoming connection attempt on a socket.
@@ -279,6 +367,7 @@ void CConnman::AcceptConnection(const ListenSocket& hListenSocket) {
 }
 ----
 
+[[select]]
 === `select()`
 
 A fair number of socket calls, like `accept()` and `recv()`, are blocking. This is a problem for real-life network applications, where a socket server needs to handle a large number of clients. 
@@ -299,17 +388,17 @@ struct timeval {
 };
 ----
 
-The select() call takes several arguments:
+The `select()` call takes several arguments:
 
 `nfds` is the highest file descriptor plus one. Thus, if two file descriptors with values 2 and 10 should be selected, then the nfds parameter should be 10 + 1 or 11 and not 2. The maximum number of sockets supported by select() has an upper limit, represented by `FD_SETSIZE` (typically `1024`). For simpler programs, passing `FD_SETSIZE` as nfds should be more than sufficient.
 
 The next three parameters represent the three different types of events monitored by the `select()`: read, write, and exception events.
 
-`readfds` is an optional pointer to a set of sockets to be checked for readability.
+`readfds` is an optional pointer to a set of sockets to be checked for readability. A read event means that for a given fd, there is either some data to be read (so the application can call `recv()`) or a new connection has been established (so the application can call `accept()`).
 
-`writefds` is an optional pointer to a set of sockets to be checked for writability.
+`writefds` is an optional pointer to a set of sockets to be checked for writability. A write event means that for a given fd, the local send buffer has become non-empty and the application can send more data.
 
-`exceptfds` is an optional pointer to a set of sockets to be checked for errors.
+`exceptfds` is an optional pointer to a set of sockets to be checked for errors. An exception event means that there is some exception event like receiving out-of-band data. 
 
 The sixth and the last argument to `select()` is a timeout value in the form of a pointer to a `timeval` structure.
 
@@ -347,6 +436,7 @@ The `select()` function is used in `CConnman::SocketEvents(...)` to select socke
 #else
 void CConnman::SocketEvents(...)
 {
+    std::set<SOCKET> recv_select_set, send_select_set, error_select_set;
     if (!GenerateSelectSet(recv_select_set, send_select_set, error_select_set)) {
         interruptNet.sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MILLISECONDS));
         return;
@@ -389,16 +479,244 @@ The `fd_set` structure is used by sockets functions and service providers, such 
 
 The code snippet just shows the process for `std::set<SOCKET> &recv_set`. Note that the same steps are apply to `std::set<SOCKET> &send_set` and `std::set<SOCKET> &error_set`. This method not only selects the sockets to be monitored, but also divides them in three sets for better handling.
 
+[[poll]]
 === `poll()`
 
-Until https://github.com/bitcoin/bitcoin/pull/14336[PR #14336], the only way to concurrently monitor multiple network connections (sockets) in Bitcoin Core was with the `select()` function, shown in the previous section.
+Until https://github.com/bitcoin/bitcoin/pull/14336[PR #14336], the only way to concurrently monitor multiple network connections (sockets) in Bitcoin Core was via the `select()` function, shown in the previous section.
 
-This PR introduced the use of `poll()` function and eliminated the restriction on maximum socket descriptor number, the `FD_SETSIZE` (typically `1024`).
+This PR introduced the use of `poll()` function and removed the restriction on the maximum number of socket descriptors, the `FD_SETSIZE` (typically `1024`). 
 
+With `poll()`, the application must allocate an array of `pollfd` structures, and pass the number of entries in this array, so there's no fundamental limit.
 
+`poll()` has some advantages over `select()`. It does not require that the user calculate the value of the highest- numbered file descriptor plus one.
 
+An it is more efficient for large-valued file descriptors.
+To watch a single file descriptor with the value 900, for example, via `select()` — the kernel needs to check each bit of each passed-in set, up to the 900th bit.
 
+[source,c++]  
+----
+#include <poll.h>
 
+int poll(struct pollfd fds[], nfds_t nfds, int timeout); 
+----
+
+This function is very similar to `select()` in that they both watch sets of file descriptors for events, such as incoming data ready to `recv()`, socket ready to `send()` data to, out-of-band data ready to `recv()`, errors, etc.
+
+The basic idea is that you pass an array of `struct pollfd` in `fds`, the size of the array in `nfds` along with a certain `timeout` in milliseconds. 
+
+The timeout can be negative if you want to wait forever. If no event happen on any of the socket descriptors by the timeout, `poll()` terminates.
+
+Each element in the array of struct `pollfd` represents one socket descriptor, and contains the following fields:
+
+[source,c++]  
+----
+struct pollfd {
+    int fd;         // the socket descriptor
+    short events;   // bitmap of events we're interested in
+    short revents;  // when poll() returns, bitmap of events that occurred
+};
+----
+
+The array's members are `pollfd` structures within which `fd` specifies an open descriptor. The events and revents are bitmasks constructed by OR'ing a combination of the following event flags.
+
+|===
+|Event | Description
+
+| POLLIN
+| Data other than high-priority data may be read without blocking.
+
+| POLLOUT
+| Normal data may be written without blocking.
+
+| POLLERR
+| An error has occurred on the device or stream. This flag is only valid in the `revents` bitmask; it will be ignored in the events member.
+
+| POLLHUP
+| The remote side of the connection hung up.
+
+|===
+
+There other flags, but Bitcoin Core uses only these.
+
+The `poll()` function is used only in Linux. As the comments below inform, the `poll()` of WIN32 and macOS is broken. if the enviroment is Linux, the `USE_POLL` directive is defined.
+
+[source,c++]  
+----
+// Note these both should work with the current usage of poll, but best to be safe
+// WIN32 poll is broken https://daniel.haxx.se/blog/2012/10/10/wsapoll-is-broken/
+// __APPLE__ poll is broke https://github.com/bitcoin/bitcoin/pull/14336#issuecomment-437384408
+#if defined(__linux__)
+#define USE_POLL
+#endif
+----
+
+There are two different versions of `CConnman::SocketEvents(..)`. One of them uses `select()` and the other uses `poll()`. The directive `USE_POLL` mentioned above decides which version will be used.
+
+[source,c++]  
+----
+#ifdef USE_POLL
+void CConnman::SocketEvents(std::set<SOCKET> &recv_set, std::set<SOCKET> &send_set, std::set<SOCKET> &error_set)
+{
+    std::set<SOCKET> recv_select_set, send_select_set, error_select_set;
+    if (!GenerateSelectSet(recv_select_set, send_select_set, error_select_set)) {
+        interruptNet.sleep_for(std::chrono::milliseconds(SELECT_TIMEOUT_MILLISECONDS));
+        return;
+    }
+
+    std::unordered_map<SOCKET, struct pollfd> pollfds;
+    for (SOCKET socket_id : recv_select_set) {
+        pollfds[socket_id].fd = socket_id;
+        pollfds[socket_id].events |= POLLIN;
+    }
+    // ...
+    std::vector<struct pollfd> vpollfds;
+    vpollfds.reserve(pollfds.size());
+    for (auto it : pollfds) {
+        vpollfds.push_back(std::move(it.second));
+    }
+
+    if (poll(vpollfds.data(), vpollfds.size(), SELECT_TIMEOUT_MILLISECONDS) < 0) return;
+
+    if (interruptNet) return;
+
+    for (struct pollfd pollfd_entry : vpollfds) {
+        if (pollfd_entry.revents & POLLIN)            recv_set.insert(pollfd_entry.fd);
+        if (pollfd_entry.revents & POLLOUT)           send_set.insert(pollfd_entry.fd);
+        if (pollfd_entry.revents & (POLLERR|POLLHUP)) error_set.insert(pollfd_entry.fd);
+    }
+}
+#else
+void CConnman::SocketEvents(...)
+{
+    // it uses `select()`, as seen in the previous section
+}
+----
+
+This version that uses the `poll(...)` starts exactly in the same way as the one using `select(...)`: retrieving via `GenerateSelectSet(...)` the sockets that will be monitored.
+
+For each of these sockets, a `struct pollfd` is created and the `fd` field of that structure receives the value of the file descriptor (socket id) and the `event` field receives the event type (`POLLIN` to receive data, `POLLOUT` for writing data and `POLLERR | POLLHUP` for error or disconnect events).
+
+After `poll(...)` is called, the method loops through `vpollfds` and splits the vector in three: `std::set<SOCKET> &recv_set`, `std::set<SOCKET> &send_set` and `std::set<SOCKET> &error_set`, according to event type. It keeps both methods (`poll()` and `select()` with same output type).
+
+[[recv]]
+=== `recv()`
+
+The `recv()` function receives a message from a connected socket.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+ssize_t recv(int socket, void *buffer, size_t length, int flags);
+----
+
+This function takes the following arguments:
+
+`socket` specifies the socket file descriptor.
+
+`buffer` points to a buffer where the message should be stored. 
+
+`length` specifies the length in bytes of the buffer pointed to by the buffer argument. 
+
+`flags` specifies the type of message reception. Bitcoin Core uses `MSG_DONTWAIT`, which enables non-blocking operation.
+
+Bitcoin Core calls `recv()` for every node when `CConnman::SocketEvents()` indicates there are sockets being monitored for read and exception events (`recv` and `error_set`).
+
+[source,c++]  
+----
+void CConnman::SocketHandler()
+{
+    std::set<SOCKET> recv_set, send_set, error_set;
+    SocketEvents(recv_set, send_set, error_set);
+    // ...
+    {
+        // ...
+        recvSet = recv_set.count(pnode->hSocket) > 0;
+        sendSet = send_set.count(pnode->hSocket) > 0;
+        errorSet = error_set.count(pnode->hSocket) > 0;
+    }
+    if (recvSet || errorSet)
+    {
+        // typical socket buffer is 8K-64K
+        uint8_t pchBuf[0x10000];
+        int nBytes = 0;
+        {
+            // ...
+            nBytes = recv(pnode->hSocket, (char*)pchBuf, sizeof(pchBuf), MSG_DONTWAIT);
+            // ...
+        }
+        // ...
+    }
+}
+----
+
+The `recv()` function is also called in `Sock::Recv` when connected through proxy.
+
+[source,c++]  
+----
+ssize_t Sock::Recv(void* buf, size_t len, int flags) const
+{
+    return recv(m_socket, static_cast<char*>(buf), len, flags);
+}
+----
+
+[[send]]
+=== `send()`
+
+The `send()` function sends data on a connected socket.
+
+[source,c++]  
+----
+#include <sys/socket.h>
+
+ssize_t send(int socket, const void *buffer, size_t length, int flags);
+----
+
+`socket` specifies the socket file descriptor.
+
+`buffer` points to the buffer containing the message to send.
+
+`length` specifies the length of the message in bytes. 
+
+`flags` specifies the type of message transmission. Bitcoin Core uses `MSG_DONTWAIT`, which enables non-blocking operation and `MSG_NOSIGNAL`, which will turn the SIGPIPE behavior off. +
+A SIGPIPE is sent to a process if it tried to write to a socket that had been shutdown for writing or isn't connected (anymore).
+
+The `send()` function is also called in `Sock::Send` when connected through proxy.
+
+[source,c++]  
+----
+ssize_t Sock::Send(const void* data, size_t len, int flags) const
+{
+    return send(m_socket, static_cast<const char*>(data), len, flags);
+}
+----
+
+[[summary]]
+=== Summary
+
+A _Socket_ refers to the connection of one host to another through the combination of compatible IP address and ports.
+
+The structure that contains the internet address is known as `sockaddr_in` and it is used to create a socket.
+
+Big-endianness is the dominant ordering in networking protocols, while little-endianness is the dominant ordering for processor architectures (x86, most ARM implementations, base RISC-V implementations). `htonl()` and `htons()` converts from host byte order to network byte order.
+
+The `socket()` function creates an unbound socket in a communications domain, and returns a file descriptor that can be used in later function calls that operate on sockets.
+
+The `setsockopt()` function provides an application program with the means to control socket behavior.
+
+The `bind()` function associates a socket with a `sockaddr_in` structure containing the IP address and port used to build the connection. 
+
+The `listen()` places a socket in a state in which it is listening for an incoming connection.
+
+The `accept()` function permits an incoming connection attempt on a socket.
+
+The `select()` function determines the status of one or more sockets, waiting if necessary, to perform synchronous I/O (receive and write data).
+
+The `pool()` function is very similar to `select()` in that they both watch sets of file descriptors for events, but more efficient.
+
+The `recv()` function receives a message from a connected socket and the `send()` function sends data on a connected socket.
+
+[[references]]
 === References
 
 https://www.die.net/[Die.net - Linux Man Page]

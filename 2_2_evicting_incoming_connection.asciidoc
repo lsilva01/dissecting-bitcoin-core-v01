@@ -1,7 +1,7 @@
 [[evicting_incoming_connection]]
 == Evicting An Incoming Connection
 
-The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference to the project’s codebase at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/6d1d33d33491a98bb0dbf64ea7e4743200e71474[6d1d33d] can be used as a reference for the project’s codebase at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin

@@ -5,7 +5,7 @@ When started for the first time, nodes do not know the IP addresses of any other
 
 Once a program has connected to the network, its peers can begin to send it https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L15[ADDR] or https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/protocol.cpp#L16[ADDV2] (address) messages with the IP addresses and port numbers of other peers on the network, providing a fully decentralized method of peer discovery. Bitcoin Core keeps a record of known peers in a https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/addrdb.h#L54[persistent on-disk database] which usually allows it to connect directly to those peers on subsequent startups without having to use DNS seeds.
 
-The commit https://github.com/bitcoin/bitcoin/commit/9313c4e6aa4b707c06a86b33d5d2753cd8383340[9313c4e6aa] can be used as a reference to the project’s codebase at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/9313c4e6aa4b707c06a86b33d5d2753cd8383340[9313c4e6aa] can be used as a reference for the project’s codebase at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin

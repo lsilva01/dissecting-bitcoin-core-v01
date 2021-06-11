@@ -3,17 +3,17 @@
 
 This text presents the main concepts of the Bitcoin Functional Test Framework, shows the most common methods and how the tests are implemented through examples. The goal is to provide a solid foundation for readers to start studying and developing their own tests.
 
-The commit https://github.com/bitcoin/bitcoin/commit/b8593616dc2ab5b8f81edd8b2408d400e3b696cd[b8593616dc2] can be used as a reference to the https://github.com/bitcoin/bitcoin/tree/b8593616dc2ab5b8f81edd8b2408d400e3b696cd[project's codebase] at the time of writing.
+The commit https://github.com/bitcoin/bitcoin/commit/b8593616dc2ab5b8f81edd8b2408d400e3b696cd[b8593616dc2] can be used as a reference for the https://github.com/bitcoin/bitcoin/tree/b8593616dc2ab5b8f81edd8b2408d400e3b696cd[project's codebase] at the time of writing.
 
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin
  git checkout -b text_branch b8593616dc2
 
-A functional test is a test that is performed to confirm that the functionality of an application or system is behaving as expected. In Bitcoin Core, it is about testing interactions of user and other nodes through RPC and P2P interfaces. 
+A functional test is a test that is performed to confirm that the functionality of an application or system is behaving as expected. In Bitcoin Core, it is used to test interactions of the user and other nodes through RPC and P2P interfaces. 
 
-It allows testing full features that take multiple layers of the stack (network, network processing, validation and so on). Two common functional test cases, for example, are the network (P2P) behavior and the RPC command, which is the tool that allows user to interact with Bitcoin Core.
+It allows the testing of full features that take multiple layers of the stack (network, network processing, validation and so on). Two common functional test cases, for example, are the network (P2P) behavior and the RPC command, which is the tool that allows the user to interact with Bitcoin Core.
 
-The functional tests are located under `https://github.com/bitcoin/bitcoin/tree/b8593616dc2ab5b8f81edd8b2408d400e3b696cd/test[/test/functional]` folder (not `https://github.com/bitcoin/bitcoin/tree/b8593616dc2ab5b8f81edd8b2408d400e3b696cd/src/test[src/test]`). There are a few different categories (areas) of tests:
+The functional tests are located in `https://github.com/bitcoin/bitcoin/tree/b8593616dc2ab5b8f81edd8b2408d400e3b696cd/test[/test/functional]` folder (not `https://github.com/bitcoin/bitcoin/tree/b8593616dc2ab5b8f81edd8b2408d400e3b696cd/src/test[src/test]`). There are a few different categories (areas) of tests:
 
 |===
 |Area | Description
