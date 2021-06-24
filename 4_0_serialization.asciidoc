@@ -105,7 +105,7 @@ One of the first difference that can be noticed between the current code and the
 
 In the code analyzed by the book, `vector_type` is a `vector<char>` with a customized allocator (called `secure_allocator`). This customized allocator clears the memory content before releasing the memory to the OS to prevent other processes running in the same machine to read the data. This ensures the security of the data it stores.
 
-In the https://github.com/bitcoin/bitcoin/pull/352[PR #352], the behaviour of locking the content of vector from being paged out of memory was added. `mlock()` lock part of the calling process's virtual address space into RAM, preventing that memory from being paged to the swap area. `munlock()` perform the converse operation,  unlocking part of the calling process's virtual address space, so that pages in the specified virtual address range may once more to be swapped out if required by the kernel memory manager.
+In the https://github.com/bitcoin/bitcoin/pull/352[PR #352], the behavior of locking the content of vector from being paged out of memory was added. `mlock()` lock part of the calling process's virtual address space into RAM, preventing that memory from being paged to the swap area. `munlock()` perform the converse operation,  unlocking part of the calling process's virtual address space, so that pages in the specified virtual address range may once more to be swapped out if required by the kernel memory manager.
 
 [source,c++]  
 ----

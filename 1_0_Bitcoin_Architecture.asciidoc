@@ -1476,8 +1476,6 @@ The `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5
 
 * `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L546[bool CheckFeeRate(...)]`: Checks that the transaction is not below the minimum fee rate allowed.
 
-Knowing the purpose of each function, it is easier to understand the `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L1058[MemPoolAccept::AcceptSingleTransaction(...)]` code.
-
 Knowing the purpose of each function, it is easier to understand the `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L1058[MemPoolAccept::AcceptSingleTransaction(...)]` code. It calls the validation methods in increasing order of CPU effort, starting with `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L951[PreChecks(args, ws)]`. This way, if the validation fails, it does it in the cheapest way possible, without overloading the CPU. 
 
 In the last method `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L1010[MemPoolAccept::Finalize(...)]`, if everything has been successfully validated, the command `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L1046[m_pool.addUnchecked(...)]` is called to add the transaction to the mempool.
@@ -1511,7 +1509,7 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(const CTransactionRef
 }
 ----
 
-Note that there is also a `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L1063[Workspace ws]` variable. It represents all the intermediate states that get passed between the various levels of checking a given transaction. But more importantly, it has a `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L510[std::unique_ptr<CTxMemPoolEntry> m_entry]` member variable. It represents the new entry that will be added to the mempool if the transaction is completely valid.
+Note that there is also a `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L1063[Workspace ws]` variable. It represents all the intermediate states that get passed between the various levels of checking a given transaction. But more importantly, it has a `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L510[std::unique_ptr<CTxMemPoolEntry> m_entry]` member variable, which represents the new entry that will be added to the mempool if the transaction is completely valid.
 
 `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/validation.cpp#L510[CTxMemPoolEntry]` represents not only the transaction that is in the mempool, but it also stores data about the corresponding transaction, like the fee, the weight, the memory usage, local time when entered into the mempool and others.
 
