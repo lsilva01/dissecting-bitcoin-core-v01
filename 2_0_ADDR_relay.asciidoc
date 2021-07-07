@@ -76,9 +76,9 @@ Usually, a node will https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a
 
 The DNS Seed servers returns a list of IP addresses that are running (or were recently running) a Bitcoin client. But in the event that the node is experiencing a DNS failure or is unable to reach the DNS Server, there are some hardcoded IP addresses in `https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/chainparamsseeds.h[chainparamsseeds.h]` file.
 
-This hardcoded list contains addresses of recently active nodes on the network and is updated every release cycle. The https://github.com/bitcoin/bitcoin/pull/18506pPR #18506] is an example of the process to update the fixed seeds.
+This hardcoded list contains addresses of recently active nodes on the network and is updated every release cycle. The https://github.com/bitcoin/bitcoin/pull/18506[PR #18506] is an example of the process to update the fixed seeds.
 
-The user can also disble the DNS Seeds by passing `-dnsseed=0` at startup. If the `dnsseed` is disabled, `-addnode` is not provided and the `-seednode` is also not provided or did not work, as a fallback, the node attempts to https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1842[expand the peers in AddrMan via fixed seeds].
+The user can also disable the DNS Seeds by passing `-dnsseed=0` at startup. If the `dnsseed` is disabled, `-addnode` is not provided and the `-seednode` is also not provided or did not work, as a fallback, the node attempts to https://github.com/bitcoin/bitcoin/blob/9313c4e6aa4b707c06a86b33d5d2753cd8383340/src/net.cpp#L1842[expand the peers in AddrMan via fixed seeds].
 
 Before https://github.com/bitcoin/bitcoin/pull/19884[PR #19884], the node would wait 60 seconds before falling back on the fixed seeds. After the PR, this happens immediately if `peers.dat` is empty and `-dnsseed=0`.
 
