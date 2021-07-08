@@ -12,7 +12,8 @@ The commit https://github.com/bitcoin/bitcoin/commit/c7dd9ff71b9c2e62fa7ecfb37ee
  git clone https://github.com/bitcoin/bitcoin.git
  cd bitcoin
  git checkout -b text_branch c7dd9ff71b
-                             
+
+[[starting_the_node]]                           
 === Starting The Node
 
 The `CConnman` and all the network processes are started in `AppInitMain(...)`, which is basically the main function of the application. When the node shuts down, connections are securely closed by `CConnman`.
@@ -53,7 +54,8 @@ The `node` variable refers to the `https://github.com/bitcoin/bitcoin/blob/c7dd9
 
 Before this struct was created, the global variable `g_conman` was used to manage the connection. But using global variables reduces the modularity and flexibility of the program, so the https://github.com/bitcoin/bitcoin/pull/16839[PR #16839] has gotten rid of the some global variables and has made `g_conman` a NodeContext member (now called `https://github.com/bitcoin/bitcoin/blob/c7dd9ff71b9c2e62fa7ecfb37ee7a5841ad67ecc/src/node/context.h#L43[connman]`).
 
-=== Starting The Connections
+[[starting_connections]]
+=== Starting Connections
 
 `CConnman::Start()` initiates all the network process and keeps them running. The first step is creating sockets for listening for incoming connections. By default, the sockets will be binded to 0.0.0.0:8333 (IPv4), [::]:8333 (IPv6) and 127.0.0.1:8334 (as a proxy for onion network). However, the user can define an different address passing it through the `-bind` or `-whitebind` argument when stating the node. This is done by `CConnman::InitBinds()`.
 
@@ -216,6 +218,7 @@ void CConnman::Interrupt()
 
 With the semaphores and flags defined, the next step is to  sequentially start all the network threads.
 
+[[thread_socket_handler]]
 === `ThreadSocketHandler`
 
 The first thread started is the `ThreadSocketHandler`. The thread's main code is a loop that runs three functions continuously until interrupted by `interruptNet` flag.
@@ -459,7 +462,7 @@ void CConnman::SocketHandler()
     // ...
 }
 ----
-
+[[thread_dns_address_seed]]
 === `ThreadDNSAddressSeed`
 
 The `ThreadDNSAddressSeed` is used to connect to DNS Servers and to retrieve  a list of IP addresses that have recently been running a Bitcoin client. 
@@ -524,6 +527,7 @@ void CConnman::ThreadDNSAddressSeed()
 }
 ----
 
+[[thread_open_added_connections]]
 === `ThreadOpenAddedConnections`
 
 The `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2538[threadOpenAddedConnections]` calls `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2064[GetAddedNodeInfo()]` to https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2123[get information about the nodes] added through the `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/rpc/net.cpp#L274[addnode]` RPC command or the `-connect` configuration option. These nodes are stored in `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.h#L1135[std::vector<std::string> vAddedNodes]`, which is protected by `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.h#L1136[cs_vAddedNodes]` mutex. `https://github.com/bitcoin/bitcoin/blob/4b5659c6b115315c9fd2902b4edd4b960a5e066e/src/net.cpp#L2118[ThreadOpenAddedConnections()]` is a infinite loop that checks the if added addresses are connected and, if not, tries to connect to them.
@@ -555,6 +559,7 @@ void CConnman::ThreadOpenAddedConnections()
 }
 ----
 
+[[thread_open_connections]]
 === `ThreadOpenConnections`
 
 `ThreadOpenConnections` initiates new connections to peers.
@@ -637,6 +642,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
 }
 ----
 
+[[thread_message_handler]]
 === `ThreadMessageHandler`
 
 Almost all `net_processing` and `validation` logic runs on this thread. As long as the flag `flagInterruptMsgProc` is true, the thread continues to send and receive messages.
@@ -681,6 +687,7 @@ void CConnman::ThreadMessageHandler()
 }
 ----
 
+[[summary]]
 === Summary
 
 The `CConnman` is the class of the network layer. It starts the network operations, handles the interruption of the network and the node shutdown.
