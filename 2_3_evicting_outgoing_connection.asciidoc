@@ -168,7 +168,11 @@ void PeerManagerImpl::CheckForStaleTipAndEvictPeers()
         }
         m_stale_tip_check_time = time_in_seconds + STALE_CHECK_INTERVAL;
     }
-    // ...
+    
+    if (!m_initial_sync_finished && CanDirectFetch()) {
+        m_connman.StartExtraBlockRelayPeers();
+        m_initial_sync_finished = true;
+    }
 }
 ----
 
@@ -181,6 +185,40 @@ The peer https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743
 After handling the block-relay-only connections, `EvictExtraOutboundPeers()` checks whether the node https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4033[has too many outbound-full-relay peers].
 
 If so, it disconnects one, choosing the  peer that https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4051[least recently announced a new block]. If there are peers with the same announcement time (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L654[CNodeState::m_last_block_announcement]`), the one with higher node id (`https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h#L730[CNode::id]`) will be selected.
+
+Another eviction logic was implemented in the https://github.com/bitcoin/bitcoin/pull/19858[PR #19858]. To make eclipse attacks more difficult, the node regularly https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1907[initiates an extra outbound block-relay connection] and stays connected long enough to sync headers and potentially learn of new blocks. If the node learns a new block, it will https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net_processing.cpp#L4009[rotate out an existing block-relay peer] in favor of the new peer.
+
+As block-relay connections use minimal bandwidth, the node can make these connections regularly and
+not just when the tip is stale.
+
+Like feeler connections, these connections are not aggressive; whenever the timer fires (once every 5 minutes on average, defined in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h[EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL]`), the node will try to initiate a new block-relay connection, but if it fail to connect it just wait for the timer to fire again before repeating with a new peer.
+
+The `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.h[CConnman::m_start_extra_block_relay_peers]` field enables the extra block-relay connection in `https://github.com/bitcoin/bitcoin/blob/6d1d33d33491a98bb0dbf64ea7e4743200e71474/src/net.cpp#L1772[CConnman::ThreadOpenConnections(...)]`. This should only be enabled after initial chain sync has occurred, as these connections are intended to be short-lived and low-bandwidth.
+
+[source,c++]  
+----
+// src/net.h
+void StartExtraBlockRelayPeers() {
+    LogPrint(BCLog::NET, "net: enabling extra block-relay-only peers\n");
+    m_start_extra_block_relay_peers = true;
+}
+// ...
+std::atomic_bool m_start_extra_block_relay_peers{false};
+
+// src/net.cpp
+void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)
+{
+    // ...
+    auto next_extra_block_relay = PoissonNextSend(start, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
+
+    // ...
+    } else if (now > next_extra_block_relay && m_start_extra_block_relay_peers) {
+        next_extra_block_relay = PoissonNextSend(now, EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL);
+        conn_type = ConnectionType::BLOCK_RELAY;
+    }
+    // ...
+}
+----
 
 [[summary]]
 === Summary

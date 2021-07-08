@@ -565,7 +565,7 @@ If the node was started with `-connect`, the thread just connects to the specifi
 
 Then, the `next_feeler` time is defined. A Feeler connection is created on average every 2 minutes. 
 
-The `next_extra_block_relay` time is also defined. Periodically (on average every 5 minutes) the node connects to a peer (using regular outbound selection methodology from `addrman`) and stays connected long enough to sync headers, but not much longer. Then the peer is disconnected, if the node hasn't learned anything new. +
+The `next_extra_block_relay` time is also defined. Periodically (on average every 5 minutes) the node connects to a peer (using a block-relay connection and the tregular outbound selection methodology from `addrman`) and stays connected long enough to sync headers, but not much longer. Then the peer is disconnected, if the node hasn't learned anything new. +
 The idea is to make eclipse attacks very difficult to execute, because every few minutes the node is finding a new peer to learn headers from.
 
 This thread calls `CConnman::ProcessAddrFetch()` in loop. This ensures that all ADDR_FETCH connections will be opened.
