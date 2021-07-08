@@ -1,7 +1,7 @@
 [[addrman]]
 == ConnMan
 
-`CConnman` class was created in the https://github.com/bitcoin/bitcoin/pull/8085[PR #8085] to to encapsulate P2P connections. Today, this class manages network layer logic.
+`CConnman` class was created in the https://github.com/bitcoin/bitcoin/pull/8085[PR #8085] to to encapsulate P2P connections. Today, this class manages the network layer logic.
 
 It creates sockets for listening for incoming connections and binds them to addresses and ports. It loads the `peer.dat` file to connect to addresses previously seen or already connected to. It also loads the `anchors.dat` to establish block-only connections. It starts the network threads. It handles the interruption of the network and the node shutdown.
 
@@ -680,3 +680,19 @@ void CConnman::ThreadMessageHandler()
     }
 }
 ----
+
+=== Summary
+
+The `CConnman` is the class of the network layer. It starts the network operations, handles the interruption of the network and the node shutdown.
+
+The operations are performed by a few threads, including: `ThreadSocketHandler`, `ThreadDNSAddressSeed`, `ThreadOpenAddedConnections`, `ThreadOpenConnections` and `ThreadMessageHandler`.
+
+`ThreadSocketHandler manages the creation, binding and release of sockets.
+
+`ThreadDNSAddressSeed` retireves from DNS Seeds a list of IP addresses that have recently been running a Bitcoin client. Typically, this only happens the first time the user starts the node.
+
+`ThreadOpenAddedConnections` tries to connect to nodes added through the `addnode` RPC command or the `-connect` configuration option.
+
+`ThreadOpenConnections` initiates new connections to peers and tries to fill all outbound connections. It also resolves the collisions on the `new` table.
+
+`ThreadMessageHandler` bridges the gap between `net` layer and `net processing` layer. While the `net` layer handles messages at socket level, the `net processing` handles at protocol level and implements the logic for each message defined in protocol.
